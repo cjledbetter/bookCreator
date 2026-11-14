@@ -11,8 +11,8 @@ pub mod inspector;
 pub mod toolbar;
 
 use book_core::{
-    AssetKind, BookDocument, ColorRgba, CommandHistory, Frame, FrameId, FrameKind, Page, Point,
-    PreflightIssue, Rect, ShapeKind, Story, TextStyle,
+    AssetKind, BookDocument, ColorRgba, CommandHistory, Frame, FrameId, FrameKind, MasterPage,
+    Page, PaperStock, Point, PreflightIssue, Rect, ShapeKind, Story, TextStyle,
 };
 use book_epub::EpubLayoutMode;
 use book_help::{create_tutorial_book, run_preflight};
@@ -89,6 +89,7 @@ pub struct BookCreatorApp {
     pub pdf_include_bleed: bool,
     pub pdf_include_crop_marks: bool,
     pub epub_layout_mode: EpubLayoutMode,
+    pub cover_paper_stock: PaperStock,
     pub status_message: String,
     pub canvas_interaction: CanvasInteractionState,
 }
@@ -126,6 +127,7 @@ impl BookCreatorApp {
             pdf_include_bleed: true,
             pdf_include_crop_marks: true,
             epub_layout_mode: EpubLayoutMode::FixedLayout,
+            cover_paper_stock: PaperStock::White,
             status_message:
                 "Loaded 4-Page Interactive Starter Tutorial Book. Drag elements or press F1 for Help Manual."
                     .to_string(),
@@ -294,6 +296,91 @@ impl BookCreatorApp {
             self.current_page += 1;
             self.recompute_layout_and_preflight();
         }
+    }
+
+    // --- 1-Click Cover & Spine Actions ---
+
+    pub fn generate_front_and_back_covers(&mut self) {
+        self.record_undo_snapshot();
+        let (_front_idx, back_idx) = self.doc.generate_front_and_back_covers();
+        self.current_page = back_idx;
+        self.selected_frame_id = None;
+        self.editing_text_frame_id = None;
+        self.recompute_layout_and_preflight();
+        self.status_message = format!(
+            "Generated Front Cover (Page 1) & Back Cover (Page {}) with Blurb, Author Bio, and ISBN Barcode!",
+            back_idx + 1
+        );
+    }
+
+    pub fn generate_wraparound_cover(&mut self) {
+        self.record_undo_snapshot();
+        let spine_pt = self.doc.calculate_spine_width_pt(self.cover_paper_stock);
+        let wrap_idx = self.doc.generate_wraparound_cover_page(self.cover_paper_stock);
+        self.current_page = wrap_idx;
+        self.selected_frame_id = None;
+        self.editing_text_frame_id = None;
+        self.recompute_layout_and_preflight();
+        self.status_message = format!(
+            "Added Wrap-Around Cover on Page {} (Spine: {:.2} pt / {:.3} in / {:.2} mm).",
+            wrap_idx + 1,
+            spine_pt,
+            spine_pt / 72.0,
+            (spine_pt / 72.0) * 25.4
+        );
+    }
+
+    pub fn jump_to_front_cover(&mut self) {
+        if !self.doc.pages.is_empty() {
+            self.current_page = 0;
+            self.selected_frame_id = None;
+            self.editing_text_frame_id = None;
+            self.status_message = "Jumped to Front Cover (Page 1).".to_string();
+        }
+    }
+
+    pub fn jump_to_back_cover(&mut self) {
+        if !self.doc.pages.is_empty() {
+            let back_idx = self
+                .doc
+                .pages
+                .iter()
+                .rposition(|p| p.title.to_lowercase().contains("back cover"))
+                .unwrap_or(self.doc.pages.len() - 1);
+            self.current_page = back_idx;
+            self.selected_frame_id = None;
+            self.editing_text_frame_id = None;
+            self.status_message = format!("Jumped to Back Cover (Page {}).", back_idx + 1);
+        }
+    }
+
+    pub fn set_page_is_cover(&mut self, page_idx: usize, is_cover: bool) {
+        if page_idx >= self.doc.pages.len() {
+            return;
+        }
+        let currently_cover = self.doc.pages[page_idx].master_id.is_none();
+        if currently_cover == is_cover {
+            return;
+        }
+        self.record_undo_snapshot();
+        if is_cover {
+            self.doc.pages[page_idx].master_id = None;
+            self.status_message = format!(
+                "Page {} set as Cover Page (page numbers & headers hidden).",
+                page_idx + 1
+            );
+        } else {
+            if self.doc.master_pages.is_empty() {
+                self.doc.master_pages.push(MasterPage::default());
+            }
+            let default_master_id = self.doc.master_pages.first().map(|m| m.id);
+            self.doc.pages[page_idx].master_id = default_master_id;
+            self.status_message = format!(
+                "Page {} linked to Master Page (page numbers & headers enabled).",
+                page_idx + 1
+            );
+        }
+        self.recompute_layout_and_preflight();
     }
 
     // --- Frame Creation, Z-Order, Deletion & Story Threading ---
@@ -750,5 +837,40 @@ mod tests {
             assert!(asset.relative_path.starts_with("assets/images/"));
             assert!(!asset.relative_path.contains("/Users/"));
         }
+    }
+
+    #[test]
+    fn one_click_cover_generation_and_spine_actions_work() {
+        let mut app = BookCreatorApp::new();
+        assert_eq!(app.doc.pages.len(), 4);
+
+        // 1-Click Front & Back Cover generation selects the newly created Back Cover page
+        app.generate_front_and_back_covers();
+        assert_eq!(app.doc.pages.len(), 5);
+        assert_eq!(app.current_page, 4);
+        assert_eq!(app.doc.pages[0].master_id, None);
+        assert_eq!(app.doc.pages[4].master_id, None);
+        assert!(app.preflight_issues.is_empty());
+
+        // Jump to Front Cover & Back Cover
+        app.jump_to_front_cover();
+        assert_eq!(app.current_page, 0);
+        app.jump_to_back_cover();
+        assert_eq!(app.current_page, 4);
+
+        // Toggle Cover Page master_id on Page 2 (index 1)
+        assert!(app.doc.pages[1].master_id.is_some());
+        app.set_page_is_cover(1, true);
+        assert_eq!(app.doc.pages[1].master_id, None);
+        app.set_page_is_cover(1, false);
+        assert!(app.doc.pages[1].master_id.is_some());
+
+        // Add Wrap-Around Cover with Cream paper stock
+        app.cover_paper_stock = PaperStock::Cream;
+        app.generate_wraparound_cover();
+        assert_eq!(app.doc.pages.len(), 6);
+        assert_eq!(app.current_page, 5);
+        assert_eq!(app.doc.pages[5].master_id, None);
+        assert!(app.preflight_issues.is_empty());
     }
 }

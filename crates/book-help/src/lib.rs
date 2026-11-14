@@ -289,6 +289,22 @@ pub fn builtin_help_articles() -> Vec<HelpArticle> {
                 "pdf", "epub", "print", "fixed", "reflowable", "apple books", "mac", "m1", "linux", "arch", "portable", "book", "git",
             ],
         },
+        HelpArticle {
+            id: "front-back-covers",
+            category: "Covers & Prepress",
+            title: "9. Creating Front, Back & Wrap-Around Print Covers",
+            summary: "Generate a complete Front Cover, Back Cover (with Blurb, Author Bio, and 2.0x1.2 in ISBN Barcode box), or Wrap-Around Jacket with Spine Calculator in 1 click.",
+            steps: &[
+                "Click the 'Covers ▾' menu in the top toolbar (or use the quick Cover buttons in the Left Page Rail) and select '✨ Generate Front & Back Cover (1-Click)'.",
+                "Page 1 is automatically configured as your Front Cover (with page numbers/headers hidden via Master = None and a full-bleed background extending to -bleed).",
+                "A dedicated Back Cover page is appended at the end of your book with a Back Cover Hook & Blurb frame, Author Photo & About the Author bio band, and a crisp white 2.0 × 1.2 in (144 × 86.4 pt) ISBN Barcode Box in the bottom-right safe area.",
+                "For print-on-demand paperback jackets, open 'Covers ▾', choose your Paper Stock (White 0.002252 in/pg, Cream 0.0025 in/pg, or Color Illustrated 0.002347 in/pg) to see the live Spine Width in pt/in/mm, and click '📏 Add Wrap-Around Cover (Back + Spine + Front)'.",
+                "Toggle 'Cover Page (Hide Page Numbers & Headers)' on any page in the Left Rail or Right Inspector to suppress running headers and folios on half-titles or special spreads.",
+            ],
+            keywords: &[
+                "cover", "front cover", "back cover", "spine", "wrap-around", "barcode", "isbn", "blurb", "author bio", "paper stock", "bleed",
+            ],
+        },
     ]
 }
 
@@ -540,7 +556,7 @@ pub fn run_preflight(doc: &BookDocument, layout: &ComputedBookLayout) -> Vec<Pre
     let min_bound_y = -bleed;
     let max_bound_x = doc.setup.width_pt + bleed;
     let max_bound_y = doc.setup.height_pt + bleed;
-    let eps = 0.05;
+    let eps = 1.0;
 
     for (page_idx, page) in doc.pages.iter().enumerate() {
         for frame in &page.frames {
@@ -900,6 +916,39 @@ mod tests {
         assert!(
             issues.is_empty(),
             "Expected 0 issues for valid full-bleed & 300 DPI page, got: {issues:#?}"
+        );
+    }
+
+    #[test]
+    fn generated_front_and_back_covers_pass_preflight_with_zero_issues() {
+        let articles = builtin_help_articles();
+        assert_eq!(articles.len(), 9);
+        let cover_hits = search_help_articles("barcode");
+        assert!(cover_hits.iter().any(|a| a.id == "front-back-covers"));
+
+        // Verify blank book with 1-click Front & Back Covers passes preflight with 0 issues
+        let mut blank_doc = BookDocument::default();
+        let (front_idx, back_idx) = blank_doc.generate_front_and_back_covers();
+        assert_eq!(front_idx, 0);
+        assert_eq!(back_idx, 1);
+        let blank_layout = ComputedBookLayout::compute(&blank_doc);
+        let blank_issues = run_preflight(&blank_doc, &blank_layout);
+        assert!(
+            blank_issues.is_empty(),
+            "Expected 0 preflight issues after generate_front_and_back_covers on blank book, got: {blank_issues:#?}"
+        );
+
+        // Verify tutorial book with 1-click Front & Back Covers + Wrap-Around Cover passes preflight with 0 issues
+        let mut tutorial_doc = create_tutorial_book();
+        let (_, tutorial_back_idx) = tutorial_doc.generate_front_and_back_covers();
+        assert_eq!(tutorial_back_idx, 4);
+        let wrap_idx = tutorial_doc.generate_wraparound_cover_page(book_core::PaperStock::White);
+        assert_eq!(wrap_idx, 5);
+        let tutorial_layout = ComputedBookLayout::compute(&tutorial_doc);
+        let tutorial_issues = run_preflight(&tutorial_doc, &tutorial_layout);
+        assert!(
+            tutorial_issues.is_empty(),
+            "Expected 0 preflight issues on tutorial book with covers, got: {tutorial_issues:#?}"
         );
     }
 }

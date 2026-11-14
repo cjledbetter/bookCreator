@@ -246,6 +246,62 @@ impl Default for PageSetup {
     }
 }
 
+/// Standard print-on-demand paper stock thickness for calculating spine width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaperStock {
+    /// Standard white uncoated paper (`0.002252 in` / page).
+    White,
+    /// Cream / natural book paper (`0.0025 in` / page).
+    Cream,
+    /// Coated color-illustrated paper (`0.002347 in` / page).
+    ColorIllustrated,
+}
+
+impl Default for PaperStock {
+    fn default() -> Self {
+        Self::White
+    }
+}
+
+impl PaperStock {
+    /// Thickness of a single page leaf side in inches for standard print-on-demand presses.
+    pub const fn thickness_per_page_in(self) -> f32 {
+        match self {
+            PaperStock::White => 0.002252,
+            PaperStock::Cream => 0.0025,
+            PaperStock::ColorIllustrated => 0.002347,
+        }
+    }
+
+    /// Thickness of a single page in typographic points (`1 in = 72 pt`).
+    pub const fn thickness_per_page_pt(self) -> f32 {
+        self.thickness_per_page_in() * 72.0
+    }
+
+    /// Exact spine width in typographic points (`1 in = 72 pt`) for a given `page_count`.
+    pub const fn spine_width_pt(self, page_count: usize) -> f32 {
+        (page_count as f32) * self.thickness_per_page_pt()
+    }
+
+    /// Human-readable label with thickness per page.
+    pub const fn label(self) -> &'static str {
+        match self {
+            PaperStock::White => "White (0.002252 in/pg)",
+            PaperStock::Cream => "Cream (0.0025 in/pg)",
+            PaperStock::ColorIllustrated => "Color Illustrated (0.002347 in/pg)",
+        }
+    }
+
+    /// Short display label.
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            PaperStock::White => "White",
+            PaperStock::Cream => "Cream",
+            PaperStock::ColorIllustrated => "Color Illustrated",
+        }
+    }
+}
+
 /// Controls how neighboring text frames wrap ("runaround") around this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum WrapMode {
@@ -784,6 +840,652 @@ impl BookDocument {
         }
         Ok(doc)
     }
+
+    /// Calculate realistic print-on-demand spine width in typographic points (`1 in = 72 pt`).
+    /// Uses `self.pages.len().max(24)` so short drafts still display a minimum printable spine.
+    pub fn calculate_spine_width_pt(&self, paper: PaperStock) -> f32 {
+        paper.spine_width_pt(self.pages.len().max(24))
+    }
+
+    /// Format the book's ISBN string for the standard Back Cover barcode box.
+    fn formatted_isbn_barcode_line(&self) -> String {
+        let raw = self.metadata.isbn.trim();
+        if raw.is_empty() {
+            "ISBN 978-0-000000-00-0 | 90000".to_string()
+        } else if raw.to_uppercase().starts_with("ISBN") {
+            if raw.contains('|') {
+                raw.to_string()
+            } else {
+                format!("{raw} | 90000")
+            }
+        } else {
+            format!("ISBN {raw} | 90000")
+        }
+    }
+
+    /// 1-click Front & Back Cover generator:
+    /// - Ensures Page 1 (`index 0`) is a Front Cover (`master_id = None` so page numbers/headers are suppressed),
+    ///   populating it with a full-bleed background, Title/Subtitle frame, Hero Cover Art frame, and Author footer
+    ///   if it does not yet have a Front Cover layout.
+    /// - Appends (or updates) a dedicated **Back Cover** as the final page (`master_id = None`) with:
+    ///   1. Full-bleed background `FrameKind::Shape` covering `(-bleed, -bleed, width + 2*bleed, height + 2*bleed)` (`z_index = 1`).
+    ///   2. **Back Cover Hook & Blurb** `FrameKind::Text` in the upper safe area using `title` & `subtitle`.
+    ///   3. **Author Photo** `FrameKind::Image` + **About the Author** `FrameKind::Text` in the middle band using `author`.
+    ///   4. Standard **ISBN Barcode Box** (`144.0 x 86.4 pt` = `2.0 x 1.2 in` crisp white `ShapeKind::Rectangle` +
+    ///      barcode label `FrameKind::Text` displaying `self.metadata.isbn` or `"ISBN 978-0-000000-00-0 | 90000"`)
+    ///      in the bottom-right safe area.
+    /// - Returns `(front_cover_page_index, back_cover_page_index)`.
+    pub fn generate_front_and_back_covers(&mut self) -> (usize, usize) {
+        let w = self.setup.width_pt.max(200.0);
+        let h = self.setup.height_pt.max(260.0);
+        let bleed = self.setup.bleed_pt.max(0.0);
+        let margin_x = self.setup.margins.outside.clamp(24.0, 54.0);
+        let margin_y = self.setup.margins.top.clamp(24.0, 54.0);
+        let safe_w = (w - margin_x * 2.0).max(140.0);
+
+        let title = if self.metadata.title.trim().is_empty() {
+            "Untitled Book".to_string()
+        } else {
+            self.metadata.title.trim().to_string()
+        };
+        let subtitle = if self.metadata.subtitle.trim().is_empty() {
+            "A Visual Print & Digital Edition".to_string()
+        } else {
+            self.metadata.subtitle.trim().to_string()
+        };
+        let author = if self.metadata.author.trim().is_empty() {
+            "Author Name".to_string()
+        } else {
+            self.metadata.author.trim().to_string()
+        };
+        let publisher = self.metadata.publisher.trim().to_string();
+
+        if self.pages.is_empty() {
+            self.pages.push(Page::new("1. Front Cover", None));
+        }
+
+        // --- 1. Ensure Page 1 (index 0) is a Front Cover with `master_id = None` ---
+        self.pages[0].master_id = None;
+        if self.pages[0].title == "Page 1" || self.pages[0].title.trim().is_empty() {
+            self.pages[0].title = "1. Front Cover".to_string();
+        }
+
+        let full_bleed_rect = Rect::new(-bleed, -bleed, w + 2.0 * bleed, h + 2.0 * bleed);
+
+        if self.pages[0].frames.is_empty() {
+            self.pages[0].background_color = ColorRgba::rgb(20, 34, 60);
+
+            let mut fc_bg = Frame::new_shape(
+                full_bleed_rect,
+                ShapeKind::Rectangle,
+                ColorRgba::rgb(20, 34, 60),
+            );
+            fc_bg.label = "Front Cover Full-Bleed Background".to_string();
+            fc_bg.z_index = 1;
+            if let FrameKind::Shape {
+                ref mut stroke_width_pt,
+                ref mut corner_radius_pt,
+                ..
+            } = fc_bg.kind
+            {
+                *stroke_width_pt = 0.0;
+                *corner_radius_pt = 0.0;
+            }
+            self.pages[0].frames.push(fc_bg);
+
+            let fc_title_story = Story::new(
+                "Front Cover Title & Subtitle",
+                format!("{}\n{}", title.to_uppercase(), subtitle),
+                TextStyle {
+                    font_family: "Literata".to_string(),
+                    font_size_pt: 18.0,
+                    line_height_factor: 1.3,
+                    bold: true,
+                    italic: false,
+                    color: ColorRgba::WHITE,
+                    alignment: TextAlignment::Center,
+                },
+            );
+            let fc_title_id = self.insert_story(fc_title_story);
+            let mut fc_title_frame = Frame::new_text(
+                Rect::new(margin_x, margin_y + 12.0, safe_w, (h * 0.22).max(115.0)),
+                fc_title_id,
+                0,
+            );
+            fc_title_frame.label = "Cover Title & Subtitle".to_string();
+            fc_title_frame.z_index = 15;
+            self.pages[0].frames.push(fc_title_frame);
+
+            let art_y = margin_y + (h * 0.25).max(135.0);
+            let art_h = (h - art_y - margin_y - 92.0).max(140.0);
+            let mut fc_art = Frame::new_image(
+                Rect::new(margin_x + 12.0, art_y, (safe_w - 24.0).max(120.0), art_h),
+                None,
+            );
+            fc_art.label = "Hero Cover Art".to_string();
+            fc_art.z_index = 10;
+            fc_art.wrap = WrapSettings {
+                mode: WrapMode::None,
+                padding_pt: 0.0,
+            };
+            if let FrameKind::Image {
+                ref mut caption, ..
+            } = fc_art.kind
+            {
+                *caption = "Hero Cover Art (Drop PNG/JPG Here)".to_string();
+            }
+            self.pages[0].frames.push(fc_art);
+
+            let footer_line = if publisher.is_empty() {
+                author.clone()
+            } else {
+                format!("{author}\n{publisher}")
+            };
+            let fc_author_story = Story::new(
+                "Front Cover Author Footer",
+                footer_line,
+                TextStyle {
+                    font_family: "Literata".to_string(),
+                    font_size_pt: 13.0,
+                    line_height_factor: 1.3,
+                    bold: true,
+                    italic: false,
+                    color: ColorRgba::WARM_GOLD,
+                    alignment: TextAlignment::Center,
+                },
+            );
+            let fc_author_id = self.insert_story(fc_author_story);
+            let mut fc_author_frame = Frame::new_text(
+                Rect::new(margin_x, h - margin_y - 68.0, safe_w, 60.0),
+                fc_author_id,
+                0,
+            );
+            fc_author_frame.label = "Front Cover Author Name".to_string();
+            fc_author_frame.z_index = 15;
+            self.pages[0].frames.push(fc_author_frame);
+        } else {
+            // Ensure existing Front Cover also has a full-bleed background frame at z_index = 1
+            let has_full_bleed = self.pages[0].frames.iter().any(|f| {
+                f.z_index <= 1
+                    && (f.rect.x - (-bleed)).abs() < 1.0
+                    && (f.rect.y - (-bleed)).abs() < 1.0
+            });
+            if !has_full_bleed {
+                let bg_col = self.pages[0].background_color;
+                let mut fc_bg = Frame::new_shape(full_bleed_rect, ShapeKind::Rectangle, bg_col);
+                fc_bg.label = "Front Cover Full-Bleed Background".to_string();
+                fc_bg.z_index = 1;
+                if let FrameKind::Shape {
+                    ref mut stroke_width_pt,
+                    ref mut corner_radius_pt,
+                    ..
+                } = fc_bg.kind
+                {
+                    *stroke_width_pt = 0.0;
+                    *corner_radius_pt = 0.0;
+                }
+                self.pages[0].frames.insert(0, fc_bg);
+            }
+        }
+
+        // --- 2. Append or update the dedicated Back Cover as the final page ---
+        let back_cover_idx = if self.pages.len() > 1
+            && self
+                .pages
+                .last()
+                .map_or(false, |p| p.title.to_lowercase().contains("back cover"))
+        {
+            self.pages.len() - 1
+        } else {
+            let next_num = self.pages.len() + 1;
+            self.pages
+                .push(Page::new(format!("{next_num}. Back Cover"), None));
+            self.pages.len() - 1
+        };
+
+        let mut back_frames = Vec::new();
+
+        // (1) Full-bleed background FrameKind::Shape covering (-bleed, -bleed, width + 2*bleed, height + 2*bleed) with z_index = 1
+        let mut bc_bg = Frame::new_shape(
+            full_bleed_rect,
+            ShapeKind::Rectangle,
+            ColorRgba::rgb(20, 34, 60),
+        );
+        bc_bg.label = "Back Cover Full-Bleed Background".to_string();
+        bc_bg.z_index = 1;
+        if let FrameKind::Shape {
+            ref mut stroke_width_pt,
+            ref mut corner_radius_pt,
+            ..
+        } = bc_bg.kind
+        {
+            *stroke_width_pt = 0.0;
+            *corner_radius_pt = 0.0;
+        }
+        back_frames.push(bc_bg);
+
+        let mut gold_bar = Frame::new_shape(
+            Rect::new(margin_x, margin_y, safe_w, 3.0),
+            ShapeKind::DividerLine,
+            ColorRgba::WARM_GOLD,
+        );
+        gold_bar.label = "Back Cover Accent Rule".to_string();
+        gold_bar.z_index = 5;
+        back_frames.push(gold_bar);
+
+        // (2) Back Cover Hook & Blurb FrameKind::Text in the upper safe area
+        let blurb_story = Story::new(
+            "Back Cover Hook & Blurb",
+            format!(
+                "{}\n{}\n\n\
+                \"A compelling, finely crafted edition designed for print and digital readers alike.\"\n\n\
+                Double-click this frame to customize your back-cover hook, synopsis, and review quotes. \
+                The background extends to the full {:.1} pt bleed while keeping all typography inside safe margins.",
+                title.to_uppercase(),
+                subtitle,
+                bleed
+            ),
+            TextStyle {
+                font_family: "Literata".to_string(),
+                font_size_pt: 11.5,
+                line_height_factor: 1.35,
+                bold: false,
+                italic: false,
+                color: ColorRgba::WHITE,
+                alignment: TextAlignment::Left,
+            },
+        );
+        let blurb_story_id = self.insert_story(blurb_story);
+        let blurb_y = margin_y + 14.0;
+        let blurb_h = (h * 0.35).clamp(160.0, 235.0);
+        let mut blurb_frame = Frame::new_text(
+            Rect::new(margin_x, blurb_y, safe_w, blurb_h),
+            blurb_story_id,
+            0,
+        );
+        blurb_frame.label = "Back Cover Hook & Blurb".to_string();
+        blurb_frame.z_index = 10;
+        back_frames.push(blurb_frame);
+
+        // (3) Author Photo FrameKind::Image + About the Author FrameKind::Text in the middle band
+        let mid_y = blurb_y + blurb_h + 16.0;
+        let photo_w = 88.0;
+        let photo_h = 108.0;
+        let mut author_photo =
+            Frame::new_image(Rect::new(margin_x, mid_y, photo_w, photo_h), None);
+        author_photo.label = "Author Photo".to_string();
+        author_photo.z_index = 15;
+        author_photo.wrap = WrapSettings {
+            mode: WrapMode::None,
+            padding_pt: 0.0,
+        };
+        if let FrameKind::Image {
+            ref mut caption, ..
+        } = author_photo.kind
+        {
+            *caption = "Author Photo".to_string();
+        }
+        back_frames.push(author_photo);
+
+        let bio_story = Story::new(
+            "About the Author",
+            format!(
+                "ABOUT THE AUTHOR\n{} is the author of {}. Double-click here to add your author bio, credentials, and website.",
+                author, title
+            ),
+            TextStyle {
+                font_family: "Literata".to_string(),
+                font_size_pt: 10.5,
+                line_height_factor: 1.35,
+                bold: false,
+                italic: false,
+                color: ColorRgba::rgb(226, 232, 240),
+                alignment: TextAlignment::Left,
+            },
+        );
+        let bio_story_id = self.insert_story(bio_story);
+        let bio_x = margin_x + photo_w + 14.0;
+        let bio_w = (w - margin_x - bio_x).max(120.0);
+        let mut bio_frame =
+            Frame::new_text(Rect::new(bio_x, mid_y, bio_w, 124.0), bio_story_id, 0);
+        bio_frame.label = "About the Author".to_string();
+        bio_frame.z_index = 15;
+        back_frames.push(bio_frame);
+
+        // (4) Standard ISBN Barcode Box (144.0 x 86.4 pt = 2.0 x 1.2 in crisp white ShapeKind::Rectangle
+        //     + barcode label FrameKind::Text) in the bottom-right safe area.
+        let barcode_w = 144.0;
+        let barcode_h = 86.4;
+        let barcode_x = (w - margin_x - barcode_w).max(margin_x);
+        let barcode_y = (h - margin_y - barcode_h).max(mid_y + 128.0);
+        let barcode_rect = Rect::new(barcode_x, barcode_y, barcode_w, barcode_h);
+
+        let mut barcode_box =
+            Frame::new_shape(barcode_rect, ShapeKind::Rectangle, ColorRgba::WHITE);
+        barcode_box.label = "ISBN Barcode Box".to_string();
+        barcode_box.z_index = 20;
+        barcode_box.wrap = WrapSettings {
+            mode: WrapMode::None,
+            padding_pt: 0.0,
+        };
+        if let FrameKind::Shape {
+            ref mut stroke_color,
+            ref mut stroke_width_pt,
+            ref mut corner_radius_pt,
+            ..
+        } = barcode_box.kind
+        {
+            *stroke_color = ColorRgba::rgb(30, 41, 59);
+            *stroke_width_pt = 1.0;
+            *corner_radius_pt = 2.0;
+        }
+        back_frames.push(barcode_box);
+
+        let isbn_line = self.formatted_isbn_barcode_line();
+        let barcode_story = Story::new(
+            "ISBN Barcode Label",
+            format!("{isbn_line}\n||||||||||||||||||||||\n9 780000 000000  90000"),
+            TextStyle {
+                font_family: "JetBrains Mono".to_string(),
+                font_size_pt: 8.0,
+                line_height_factor: 1.25,
+                bold: true,
+                italic: false,
+                color: ColorRgba::BLACK,
+                alignment: TextAlignment::Center,
+            },
+        );
+        let barcode_story_id = self.insert_story(barcode_story);
+        let mut barcode_label = Frame::new_text(
+            Rect::new(
+                barcode_x + 4.0,
+                barcode_y + 6.0,
+                barcode_w - 8.0,
+                barcode_h - 10.0,
+            ),
+            barcode_story_id,
+            0,
+        );
+        barcode_label.label = "ISBN Barcode Label".to_string();
+        barcode_label.z_index = 25;
+        if let FrameKind::Text {
+            ref mut padding_pt, ..
+        } = barcode_label.kind
+        {
+            *padding_pt = 4.0;
+        }
+        back_frames.push(barcode_label);
+
+        let back_page = &mut self.pages[back_cover_idx];
+        back_page.master_id = None;
+        back_page.background_color = ColorRgba::rgb(20, 34, 60);
+        back_page.frames = back_frames;
+
+        (0, back_cover_idx)
+    }
+
+    /// Appends a `"Wrap-Around Cover (Back + Spine + Front)"` page (`master_id = None`)
+    /// laying out left-half Back Cover frames (blurb + ISBN barcode box), a center Spine strip
+    /// with calculated spine width label, and right-half Front Cover frames.
+    /// Returns the newly appended page index.
+    pub fn generate_wraparound_cover_page(&mut self, paper: PaperStock) -> usize {
+        let spine_pt = self.calculate_spine_width_pt(paper);
+        let spine_in = spine_pt / 72.0;
+        let spine_mm = spine_in * 25.4;
+
+        let w = self.setup.width_pt.max(240.0);
+        let h = self.setup.height_pt.max(260.0);
+        let bleed = self.setup.bleed_pt.max(0.0);
+
+        let title = if self.metadata.title.trim().is_empty() {
+            "Untitled Book".to_string()
+        } else {
+            self.metadata.title.trim().to_string()
+        };
+        let subtitle = if self.metadata.subtitle.trim().is_empty() {
+            "Print Wrap-Around Edition".to_string()
+        } else {
+            self.metadata.subtitle.trim().to_string()
+        };
+        let author = if self.metadata.author.trim().is_empty() {
+            "Author Name".to_string()
+        } else {
+            self.metadata.author.trim().to_string()
+        };
+
+        let mut page = Page::new("Wrap-Around Cover (Back + Spine + Front)", None);
+        page.background_color = ColorRgba::rgb(20, 34, 60);
+
+        // 1. Full-bleed wrap-around background
+        let mut bg = Frame::new_shape(
+            Rect::new(-bleed, -bleed, w + 2.0 * bleed, h + 2.0 * bleed),
+            ShapeKind::Rectangle,
+            ColorRgba::rgb(20, 34, 60),
+        );
+        bg.label = "Wrap-Around Full-Bleed Background".to_string();
+        bg.z_index = 1;
+        if let FrameKind::Shape {
+            ref mut stroke_width_pt,
+            ref mut corner_radius_pt,
+            ..
+        } = bg.kind
+        {
+            *stroke_width_pt = 0.0;
+            *corner_radius_pt = 0.0;
+        }
+        page.frames.push(bg);
+
+        // Geometry for Left (Back Cover), Center (Spine), and Right (Front Cover)
+        let visual_spine_w = spine_pt.clamp(32.0, 56.0);
+        let spine_x = (w - visual_spine_w) * 0.5;
+        let pad = 14.0;
+        let left_w = (spine_x - pad * 2.0).max(110.0);
+        let right_x = spine_x + visual_spine_w + pad;
+        let right_w = (w - right_x - pad).max(110.0);
+
+        // 2. Center Spine Strip & Spine Width Label
+        let mut spine_strip = Frame::new_shape(
+            Rect::new(spine_x, -bleed, visual_spine_w, h + 2.0 * bleed),
+            ShapeKind::Rectangle,
+            ColorRgba::rgb(12, 22, 42),
+        );
+        spine_strip.label = "Center Spine Strip".to_string();
+        spine_strip.z_index = 5;
+        if let FrameKind::Shape {
+            ref mut stroke_color,
+            ref mut stroke_width_pt,
+            ref mut corner_radius_pt,
+            ..
+        } = spine_strip.kind
+        {
+            *stroke_color = ColorRgba::WARM_GOLD;
+            *stroke_width_pt = 1.0;
+            *corner_radius_pt = 0.0;
+        }
+        page.frames.push(spine_strip);
+
+        let spine_story = Story::new(
+            "Spine Width Label",
+            format!(
+                "SPINE\n{:.1} pt\n{:.3} in\n{:.1} mm\n({})\n\n{}\n{}",
+                spine_pt,
+                spine_in,
+                spine_mm,
+                paper.short_label(),
+                title,
+                author
+            ),
+            TextStyle {
+                font_family: "Inter".to_string(),
+                font_size_pt: 8.0,
+                line_height_factor: 1.25,
+                bold: true,
+                italic: false,
+                color: ColorRgba::WARM_GOLD,
+                alignment: TextAlignment::Center,
+            },
+        );
+        let spine_story_id = self.insert_story(spine_story);
+        let mut spine_label = Frame::new_text(
+            Rect::new(spine_x - 6.0, 28.0, visual_spine_w + 12.0, h - 56.0),
+            spine_story_id,
+            0,
+        );
+        spine_label.label = format!("Spine Label ({spine_pt:.1} pt / {spine_in:.3} in)");
+        spine_label.z_index = 18;
+        if let FrameKind::Text {
+            ref mut padding_pt, ..
+        } = spine_label.kind
+        {
+            *padding_pt = 2.0;
+        }
+        page.frames.push(spine_label);
+
+        // 3. Left-Half: Back Cover Blurb + ISBN Barcode Box
+        let back_blurb_story = Story::new(
+            "Wrap-Around Back Cover Blurb",
+            format!(
+                "BACK COVER\n{}\n\n\
+                Double-click to edit back-cover synopsis, hooks, and review quotes for your print jacket.\n\n\
+                Author: {}",
+                title.to_uppercase(),
+                author
+            ),
+            TextStyle {
+                font_family: "Literata".to_string(),
+                font_size_pt: 10.0,
+                line_height_factor: 1.3,
+                bold: false,
+                italic: false,
+                color: ColorRgba::WHITE,
+                alignment: TextAlignment::Left,
+            },
+        );
+        let back_blurb_id = self.insert_story(back_blurb_story);
+        let mut back_blurb_frame = Frame::new_text(
+            Rect::new(pad, 36.0, left_w, (h * 0.52).max(200.0)),
+            back_blurb_id,
+            0,
+        );
+        back_blurb_frame.label = "Back Cover Hook & Blurb".to_string();
+        back_blurb_frame.z_index = 10;
+        page.frames.push(back_blurb_frame);
+
+        let bc_box_w = left_w.min(144.0);
+        let bc_box_h = 86.4;
+        let bc_box_x = (spine_x - pad - bc_box_w).max(pad);
+        let bc_box_y = (h - 36.0 - bc_box_h).max(340.0);
+        let mut bc_box = Frame::new_shape(
+            Rect::new(bc_box_x, bc_box_y, bc_box_w, bc_box_h),
+            ShapeKind::Rectangle,
+            ColorRgba::WHITE,
+        );
+        bc_box.label = "Wrap-Around ISBN Barcode Box".to_string();
+        bc_box.z_index = 20;
+        bc_box.wrap = WrapSettings {
+            mode: WrapMode::None,
+            padding_pt: 0.0,
+        };
+        page.frames.push(bc_box);
+
+        let isbn_line = self.formatted_isbn_barcode_line();
+        let bc_label_story = Story::new(
+            "Wrap-Around ISBN Barcode Label",
+            format!("{isbn_line}\n||||||||||||||||||||\n9 780000 000000"),
+            TextStyle {
+                font_family: "JetBrains Mono".to_string(),
+                font_size_pt: 7.5,
+                line_height_factor: 1.2,
+                bold: true,
+                italic: false,
+                color: ColorRgba::BLACK,
+                alignment: TextAlignment::Center,
+            },
+        );
+        let bc_label_id = self.insert_story(bc_label_story);
+        let mut bc_label_frame = Frame::new_text(
+            Rect::new(bc_box_x + 3.0, bc_box_y + 5.0, bc_box_w - 6.0, bc_box_h - 8.0),
+            bc_label_id,
+            0,
+        );
+        bc_label_frame.label = "Wrap-Around ISBN Label".to_string();
+        bc_label_frame.z_index = 25;
+        if let FrameKind::Text {
+            ref mut padding_pt, ..
+        } = bc_label_frame.kind
+        {
+            *padding_pt = 2.0;
+        }
+        page.frames.push(bc_label_frame);
+
+        // 4. Right-Half: Front Cover Title, Hero Art & Author Footer
+        let front_title_story = Story::new(
+            "Wrap-Around Front Cover Title",
+            format!("FRONT COVER\n{}\n{}", title.to_uppercase(), subtitle),
+            TextStyle {
+                font_family: "Literata".to_string(),
+                font_size_pt: 12.5,
+                line_height_factor: 1.3,
+                bold: true,
+                italic: false,
+                color: ColorRgba::WHITE,
+                alignment: TextAlignment::Center,
+            },
+        );
+        let front_title_id = self.insert_story(front_title_story);
+        let mut front_title_frame = Frame::new_text(
+            Rect::new(right_x, 36.0, right_w, 140.0),
+            front_title_id,
+            0,
+        );
+        front_title_frame.label = "Front Cover Title & Subtitle".to_string();
+        front_title_frame.z_index = 15;
+        page.frames.push(front_title_frame);
+
+        let mut front_art = Frame::new_image(
+            Rect::new(right_x, 190.0, right_w, (h - 300.0).max(140.0)),
+            None,
+        );
+        front_art.label = "Front Cover Hero Art".to_string();
+        front_art.z_index = 10;
+        front_art.wrap = WrapSettings {
+            mode: WrapMode::None,
+            padding_pt: 0.0,
+        };
+        if let FrameKind::Image {
+            ref mut caption, ..
+        } = front_art.kind
+        {
+            *caption = "Front Cover Art".to_string();
+        }
+        page.frames.push(front_art);
+
+        let front_author_story = Story::new(
+            "Wrap-Around Front Cover Author",
+            author,
+            TextStyle {
+                font_family: "Literata".to_string(),
+                font_size_pt: 11.0,
+                line_height_factor: 1.25,
+                bold: true,
+                italic: false,
+                color: ColorRgba::WARM_GOLD,
+                alignment: TextAlignment::Center,
+            },
+        );
+        let front_author_id = self.insert_story(front_author_story);
+        let mut front_author_frame = Frame::new_text(
+            Rect::new(right_x, h - 92.0, right_w, 56.0),
+            front_author_id,
+            0,
+        );
+        front_author_frame.label = "Front Cover Author".to_string();
+        front_author_frame.z_index = 15;
+        page.frames.push(front_author_frame);
+
+        self.pages.push(page);
+        self.pages.len() - 1
+    }
 }
 
 /// Undo / Redo snapshot history for non-destructive editing.
@@ -908,5 +1610,100 @@ mod tests {
         loaded.save_book_directory(&dir_path).unwrap();
         let dir_loaded = BookDocument::load_book_directory(&dir_path).unwrap();
         assert_eq!(dir_loaded.threaded_frames_for_story(story_id).len(), 2);
+    }
+
+    #[test]
+    fn paper_stock_spine_width_and_cover_generators_work() {
+        // 1. Verify exact PaperStock::spine_width_pt calculations
+        let white_100 = PaperStock::White.spine_width_pt(100);
+        assert!((white_100 - 100.0 * 0.002252 * 72.0).abs() < 1e-4);
+
+        let cream_100 = PaperStock::Cream.spine_width_pt(100);
+        assert!((cream_100 - 100.0 * 0.0025 * 72.0).abs() < 1e-4);
+
+        let color_100 = PaperStock::ColorIllustrated.spine_width_pt(100);
+        assert!((color_100 - 100.0 * 0.002347 * 72.0).abs() < 1e-4);
+
+        // 2. Verify BookDocument::calculate_spine_width_pt uses pages.len().max(24)
+        let mut doc = BookDocument::default();
+        doc.metadata.title = "Rust Systems Publishing".to_string();
+        doc.metadata.subtitle = "High-Speed Print & EPUB 3".to_string();
+        doc.metadata.author = "Ada Lovelace".to_string();
+        doc.metadata.isbn = "978-1-4920-0000-0".to_string();
+
+        assert_eq!(doc.pages.len(), 1);
+        assert!(
+            (doc.calculate_spine_width_pt(PaperStock::Cream)
+                - PaperStock::Cream.spine_width_pt(24))
+            .abs()
+                < 1e-4
+        );
+
+        // 3. Verify generate_front_and_back_covers on a blank 1-page book
+        let (front_idx, back_idx) = doc.generate_front_and_back_covers();
+        assert_eq!(front_idx, 0);
+        assert_eq!(back_idx, 1);
+        assert_eq!(doc.pages.len(), 2);
+        assert_eq!(doc.pages[front_idx].master_id, None);
+        assert_eq!(doc.pages[back_idx].master_id, None);
+        assert!(!doc.pages[front_idx].frames.is_empty());
+
+        let bleed = doc.setup.bleed_pt;
+        let back_page = &doc.pages[back_idx];
+        // Full-bleed background with z_index = 1
+        assert!(back_page.frames.iter().any(|f| {
+            f.z_index == 1
+                && (f.rect.x - (-bleed)).abs() < 0.01
+                && (f.rect.y - (-bleed)).abs() < 0.01
+                && (f.rect.width - (doc.setup.width_pt + 2.0 * bleed)).abs() < 0.01
+                && (f.rect.height - (doc.setup.height_pt + 2.0 * bleed)).abs() < 0.01
+        }));
+        // Back Cover Hook & Blurb frame
+        assert!(back_page
+            .frames
+            .iter()
+            .any(|f| f.label.contains("Hook & Blurb") && matches!(f.kind, FrameKind::Text { .. })));
+        // Author Photo + About the Author
+        assert!(back_page
+            .frames
+            .iter()
+            .any(|f| f.label.contains("Author Photo") && matches!(f.kind, FrameKind::Image { .. })));
+        assert!(back_page
+            .frames
+            .iter()
+            .any(|f| f.label.contains("About the Author") && matches!(f.kind, FrameKind::Text { .. })));
+        // Standard 144.0 x 86.4 pt (2.0 x 1.2 in) white ISBN Barcode Box
+        assert!(back_page.frames.iter().any(|f| {
+            f.label.contains("ISBN Barcode Box")
+                && (f.rect.width - 144.0).abs() < 0.01
+                && (f.rect.height - 86.4).abs() < 0.01
+                && matches!(
+                    f.kind,
+                    FrameKind::Shape {
+                        kind: ShapeKind::Rectangle,
+                        fill,
+                        ..
+                    } if fill == ColorRgba::WHITE
+                )
+        }));
+
+        // Calling generate_front_and_back_covers again updates Back Cover in place
+        let (front_idx2, back_idx2) = doc.generate_front_and_back_covers();
+        assert_eq!(front_idx2, 0);
+        assert_eq!(back_idx2, 1);
+        assert_eq!(doc.pages.len(), 2);
+
+        // 4. Verify generate_wraparound_cover_page
+        let wrap_idx = doc.generate_wraparound_cover_page(PaperStock::White);
+        assert_eq!(wrap_idx, 2);
+        assert_eq!(
+            doc.pages[wrap_idx].title,
+            "Wrap-Around Cover (Back + Spine + Front)"
+        );
+        assert_eq!(doc.pages[wrap_idx].master_id, None);
+        assert!(doc.pages[wrap_idx]
+            .frames
+            .iter()
+            .any(|f| f.label.contains("Spine")));
     }
 }

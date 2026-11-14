@@ -7,7 +7,8 @@
 //!   and Active Page background.
 
 use book_core::{
-    ColorRgba, FrameId, FrameKind, ImageFit, PagePreset, ShapeKind, TextAlignment, WrapMode,
+    ColorRgba, FrameId, FrameKind, ImageFit, PagePreset, PaperStock, ShapeKind, TextAlignment,
+    WrapMode,
 };
 use eframe::egui;
 
@@ -680,6 +681,7 @@ fn show_document_and_page_inspector(app: &mut BookCreatorApp, ui: &mut egui::Ui)
             ui.end_row();
         });
 
+    let mut toggle_cover_state = None;
     if let Some(page) = app.doc.pages.get_mut(app.current_page) {
         ui.separator();
         ui.label(egui::RichText::new("Active Page Settings").strong());
@@ -694,6 +696,68 @@ fn show_document_and_page_inspector(app: &mut BookCreatorApp, ui: &mut egui::Ui)
                 page.background_color = from_color32(bg);
             }
         });
+        let mut is_cover = page.master_id.is_none();
+        if ui
+            .checkbox(
+                &mut is_cover,
+                "Cover Page (Hide Page Numbers & Headers)",
+            )
+            .changed()
+        {
+            toggle_cover_state = Some(is_cover);
+        }
+    }
+    if let Some(is_cover) = toggle_cover_state {
+        let cur = app.current_page;
+        app.set_page_is_cover(cur, is_cover);
+    }
+
+    ui.separator();
+    ui.label(egui::RichText::new("Front, Back & Wrap-Around Covers").strong());
+    if ui
+        .button("✨ Generate Front & Back Cover (1-Click)")
+        .on_hover_text(
+            "Configure Page 1 as Front Cover and append/update a Back Cover with Blurb, Author Bio & ISBN Barcode Box",
+        )
+        .clicked()
+    {
+        app.generate_front_and_back_covers();
+    }
+    ui.horizontal(|ui| {
+        if ui.button("⬅ Jump to Front Cover").clicked() {
+            app.jump_to_front_cover();
+        }
+        if ui.button("➡ Jump to Back Cover").clicked() {
+            app.jump_to_back_cover();
+        }
+    });
+
+    ui.horizontal(|ui| {
+        ui.label("Paper Stock:");
+        for stock in [
+            PaperStock::White,
+            PaperStock::Cream,
+            PaperStock::ColorIllustrated,
+        ] {
+            ui.selectable_value(&mut app.cover_paper_stock, stock, stock.short_label());
+        }
+    });
+    let spine_pt = app.doc.calculate_spine_width_pt(app.cover_paper_stock);
+    let spine_in = spine_pt / 72.0;
+    let spine_mm = spine_in * 25.4;
+    ui.label(
+        egui::RichText::new(format!(
+            "Spine Width: {:.2} pt ({:.3} in / {:.2} mm)",
+            spine_pt, spine_in, spine_mm
+        ))
+        .small()
+        .color(egui::Color32::from_rgb(232, 168, 56)),
+    );
+    if ui
+        .button("📏 Add Wrap-Around Cover (Back + Spine + Front)")
+        .clicked()
+    {
+        app.generate_wraparound_cover();
     }
 
     if layout_dirty {

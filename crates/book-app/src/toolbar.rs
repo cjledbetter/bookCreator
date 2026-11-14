@@ -2,7 +2,7 @@
 //! Export, Live Preflight badge, Zoom, View toggles, Help Manual button) and Left Page
 //! & Master Page Rail with miniature visual frame thumbnails.
 
-use book_core::{BookDocument, FrameKind, PagePreset, PreflightSeverity, ShapeKind};
+use book_core::{BookDocument, FrameKind, PagePreset, PaperStock, PreflightSeverity, ShapeKind};
 use book_epub::{export_epub_to_file, EpubLayoutMode};
 use book_help::primary_modifier_label;
 use book_pdf::{export_pdf_to_file, PdfExportOptions};
@@ -206,7 +206,88 @@ pub fn show_top_toolbar(app: &mut BookCreatorApp, ctx: &egui::Context) {
 
                 ui.separator();
 
-                // --- 5. Equal-Priority Print PDF & EPUB 3 Exporters ---
+                // --- 5. Covers & Equal-Priority Print PDF / EPUB 3 Exporters ---
+                ui.menu_button("📕 Covers ▾", |ui| {
+                    ui.set_min_width(290.0);
+                    ui.label(egui::RichText::new("Front, Back & Wrap-Around Covers").strong());
+                    if ui
+                        .button("✨ Generate Front & Back Cover (1-Click)")
+                        .on_hover_text(
+                            "Ensure Page 1 is a Front Cover and append/update a Back Cover with Blurb, Author Bio & 2.0×1.2 in ISBN Barcode Box",
+                        )
+                        .clicked()
+                    {
+                        app.generate_front_and_back_covers();
+                        ui.close_menu();
+                    }
+
+                    ui.horizontal(|ui| {
+                        if ui.button("⬅ Jump to Front Cover").clicked() {
+                            app.jump_to_front_cover();
+                            ui.close_menu();
+                        }
+                        if ui.button("➡ Jump to Back Cover").clicked() {
+                            app.jump_to_back_cover();
+                            ui.close_menu();
+                        }
+                    });
+
+                    if let Some(page) = app.doc.pages.get(app.current_page) {
+                        let mut is_cover = page.master_id.is_none();
+                        if ui
+                            .checkbox(
+                                &mut is_cover,
+                                "Cover Page (Hide Page Numbers & Headers)",
+                            )
+                            .changed()
+                        {
+                            let cur = app.current_page;
+                            app.set_page_is_cover(cur, is_cover);
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("Wrap-Around Print Jacket & Spine").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("Paper Stock:");
+                        for stock in [
+                            PaperStock::White,
+                            PaperStock::Cream,
+                            PaperStock::ColorIllustrated,
+                        ] {
+                            ui.selectable_value(
+                                &mut app.cover_paper_stock,
+                                stock,
+                                stock.short_label(),
+                            );
+                        }
+                    });
+
+                    let page_count = app.doc.pages.len();
+                    let spine_pt = app.doc.calculate_spine_width_pt(app.cover_paper_stock);
+                    let spine_in = spine_pt / 72.0;
+                    let spine_mm = spine_in * 25.4;
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Spine Width ({} pgs, min 24): {:.2} pt | {:.3} in | {:.2} mm",
+                            page_count, spine_pt, spine_in, spine_mm
+                        ))
+                        .small()
+                        .color(egui::Color32::from_rgb(232, 168, 56)),
+                    );
+
+                    if ui
+                        .button("📏 Add Wrap-Around Cover (Back + Spine + Front)")
+                        .on_hover_text(
+                            "Append a complete wrap-around cover spread with Back Cover, calculated Spine strip, and Front Cover",
+                        )
+                        .clicked()
+                    {
+                        app.generate_wraparound_cover();
+                        ui.close_menu();
+                    }
+                });
+
                 ui.menu_button("🖨 Export PDF", |ui| {
                     ui.set_min_width(220.0);
                     ui.label(egui::RichText::new("Print-Ready PDF Setup").strong());
@@ -364,6 +445,41 @@ pub fn show_left_page_rail(app: &mut BookCreatorApp, ctx: &egui::Context) {
                     .clicked()
                 {
                     app.move_current_page_down();
+                }
+            });
+
+            // Quick 1-Click Cover Buttons in Left Page Rail
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if ui
+                    .small_button("✨ Generate Front & Back Cover (1-Click)")
+                    .on_hover_text(
+                        "Create Front Cover (Page 1) and Back Cover (final page with Blurb, Author Bio & ISBN Barcode)",
+                    )
+                    .clicked()
+                {
+                    app.generate_front_and_back_covers();
+                }
+                if ui
+                    .small_button("📏 Wrap-Around")
+                    .on_hover_text("Append a Wrap-Around Cover (Back + Spine + Front)")
+                    .clicked()
+                {
+                    app.generate_wraparound_cover();
+                }
+                if ui
+                    .small_button("Front")
+                    .on_hover_text("Jump to Front Cover (Page 1)")
+                    .clicked()
+                {
+                    app.jump_to_front_cover();
+                }
+                if ui
+                    .small_button("Back")
+                    .on_hover_text("Jump to Back Cover")
+                    .clicked()
+                {
+                    app.jump_to_back_cover();
                 }
             });
 
@@ -543,6 +659,20 @@ pub fn show_left_page_rail(app: &mut BookCreatorApp, ctx: &egui::Context) {
                     app.doc.setup.height_pt = h;
                 }
                 app.recompute_layout_and_preflight();
+            }
+
+            if let Some(page) = app.doc.pages.get(app.current_page) {
+                let mut is_cover = page.master_id.is_none();
+                if ui
+                    .checkbox(
+                        &mut is_cover,
+                        "Cover Page (Hide Page Numbers & Headers)",
+                    )
+                    .changed()
+                {
+                    let cur = app.current_page;
+                    app.set_page_is_cover(cur, is_cover);
+                }
             }
 
             if let Some(master) = app.doc.master_pages.first_mut() {

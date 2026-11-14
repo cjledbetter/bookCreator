@@ -451,31 +451,40 @@ pub fn show_spread_canvas(app: &mut BookCreatorApp, ui: &mut egui::Ui) {
         );
     }
 
-    // 4. Draw Master Page Header & Page Number
-    if let Some(master) = app.doc.master_pages.first() {
-        let safe_rect = app.doc.setup.safe_margin_rect(app.current_page);
-        if !master.header_text.is_empty() {
-            let header_pos = tf.to_screen(Point::new(safe_rect.x, (safe_rect.y - 18.0).max(8.0)));
-            painter.text(
-                header_pos,
-                egui::Align2::LEFT_TOP,
-                &master.header_text,
-                egui::FontId::proportional((9.5 * app.zoom).max(8.0)),
-                egui::Color32::from_rgb(120, 128, 142),
-            );
-        }
-        if master.show_page_numbers {
-            let num_pos = tf.to_screen(Point::new(
-                app.doc.setup.width_pt * 0.5,
-                (app.doc.setup.height_pt - 22.0).max(10.0),
-            ));
-            painter.text(
-                num_pos,
-                egui::Align2::CENTER_TOP,
-                format!("— {} —", app.current_page + 1),
-                egui::FontId::proportional((10.0 * app.zoom).max(8.0)),
-                egui::Color32::from_rgb(110, 118, 132),
-            );
+    // 4. Draw Master Page Header & Page Number (suppressed on Cover Pages where `master_id.is_none()`)
+    if let Some(master_id) = app.doc.pages[app.current_page].master_id {
+        if let Some(master) = app
+            .doc
+            .master_pages
+            .iter()
+            .find(|m| m.id == master_id)
+            .or_else(|| app.doc.master_pages.first())
+        {
+            let safe_rect = app.doc.setup.safe_margin_rect(app.current_page);
+            if !master.header_text.is_empty() {
+                let header_pos =
+                    tf.to_screen(Point::new(safe_rect.x, (safe_rect.y - 18.0).max(8.0)));
+                painter.text(
+                    header_pos,
+                    egui::Align2::LEFT_TOP,
+                    &master.header_text,
+                    egui::FontId::proportional((9.5 * app.zoom).max(8.0)),
+                    egui::Color32::from_rgb(120, 128, 142),
+                );
+            }
+            if master.show_page_numbers {
+                let num_pos = tf.to_screen(Point::new(
+                    app.doc.setup.width_pt * 0.5,
+                    (app.doc.setup.height_pt - 22.0).max(10.0),
+                ));
+                painter.text(
+                    num_pos,
+                    egui::Align2::CENTER_TOP,
+                    format!("— {} —", app.current_page + 1),
+                    egui::FontId::proportional((10.0 * app.zoom).max(8.0)),
+                    egui::Color32::from_rgb(110, 118, 132),
+                );
+            }
         }
     }
 
@@ -491,6 +500,32 @@ pub fn show_spread_canvas(app: &mut BookCreatorApp, ui: &mut egui::Ui) {
         app.show_margins_and_bleed,
         &mut overflow_ports,
     );
+
+    // Re-draw Trim & Safe Margin overlay lines above full-bleed background shapes
+    if app.show_margins_and_bleed {
+        let safe_rect = app.doc.setup.safe_margin_rect(app.current_page);
+        let safe_screen = tf.rect_to_screen(safe_rect);
+        painter.rect_stroke(
+            safe_screen,
+            0.0,
+            egui::Stroke::new(
+                1.0_f32,
+                egui::Color32::from_rgba_unmultiplied(110, 165, 250, 110),
+            ),
+            egui::StrokeKind::Inside,
+        );
+        if app.doc.setup.bleed_pt > 0.0 {
+            let bleed_screen = tf.rect_to_screen(page_rect_pt.expand(app.doc.setup.bleed_pt));
+            draw_dashed_rect(
+                &painter,
+                bleed_screen,
+                egui::Color32::from_rgb(235, 87, 87),
+                1.2,
+                6.0,
+                4.0,
+            );
+        }
+    }
 
     // 6. Render Text Threading Lines (when LinkText tool is active or Show Thread Lines is enabled)
     if app.show_thread_lines || app.active_tool == Tool::LinkText {
