@@ -744,36 +744,40 @@ impl BookDocument {
         id
     }
 
-    /// Save as a single-file portable `.book` ZIP archive.
-    pub fn save_book_archive(&self, path: impl AsRef<Path>) -> Result<(), BookError> {
-        let file = File::create(path)?;
-        let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+    /// Serialize the complete project (metadata, document, and embedded binary assets)
+    /// into an in-memory `.book` ZIP archive byte buffer (works on both native desktop and WebAssembly).
+    pub fn to_book_archive_bytes(&self) -> Result<Vec<u8>, BookError> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
 
-        let manifest_json = serde_json::to_vec_pretty(&self.metadata)?;
-        zip.start_file("manifest.json", options)?;
-        zip.write_all(&manifest_json)?;
+            let manifest_json = serde_json::to_vec_pretty(&self.metadata)?;
+            zip.start_file("manifest.json", options)?;
+            zip.write_all(&manifest_json)?;
 
-        let doc_json = serde_json::to_vec_pretty(self)?;
-        zip.start_file("document.json", options)?;
-        zip.write_all(&doc_json)?;
+            let doc_json = serde_json::to_vec_pretty(self)?;
+            zip.start_file("document.json", options)?;
+            zip.write_all(&doc_json)?;
 
-        for (asset_id, entry) in &self.assets {
-            if let Some(bytes) = self.asset_bytes.get(asset_id) {
-                zip.start_file(&entry.relative_path, options)?;
-                zip.write_all(bytes)?;
+            for (asset_id, entry) in &self.assets {
+                if let Some(bytes) = self.asset_bytes.get(asset_id) {
+                    zip.start_file(&entry.relative_path, options)?;
+                    zip.write_all(bytes)?;
+                }
             }
-        }
 
-        zip.finish()?;
-        Ok(())
+            zip.finish()?;
+        }
+        Ok(cursor.into_inner())
     }
 
-    /// Load a single-file portable `.book` ZIP archive.
-    pub fn load_book_archive(path: impl AsRef<Path>) -> Result<Self, BookError> {
-        let file = File::open(path)?;
-        let mut archive = zip::ZipArchive::new(file)?;
+    /// Deserialize a `BookDocument` from an in-memory `.book` ZIP archive byte slice
+    /// (works on both native desktop and WebAssembly).
+    pub fn from_book_archive_bytes(bytes: &[u8]) -> Result<Self, BookError> {
+        let cursor = std::io::Cursor::new(bytes);
+        let mut archive = zip::ZipArchive::new(cursor)?;
 
         let mut doc_bytes = Vec::new();
         {
@@ -799,6 +803,22 @@ impl BookDocument {
         }
 
         Ok(doc)
+    }
+
+    /// Save as a single-file portable `.book` ZIP archive.
+    pub fn save_book_archive(&self, path: impl AsRef<Path>) -> Result<(), BookError> {
+        let bytes = self.to_book_archive_bytes()?;
+        let mut file = File::create(path)?;
+        file.write_all(&bytes)?;
+        Ok(())
+    }
+
+    /// Load a single-file portable `.book` ZIP archive.
+    pub fn load_book_archive(path: impl AsRef<Path>) -> Result<Self, BookError> {
+        let mut file = File::open(path)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Self::from_book_archive_bytes(&bytes)
     }
 
     /// Save as an unpacked, Git-friendly `.bookdir` directory.
@@ -1610,6 +1630,17 @@ mod tests {
         loaded.save_book_directory(&dir_path).unwrap();
         let dir_loaded = BookDocument::load_book_directory(&dir_path).unwrap();
         assert_eq!(dir_loaded.threaded_frames_for_story(story_id).len(), 2);
+
+        // Also verify in-memory `.book` archive byte roundtrip (used by WebAssembly / GitHub Pages)
+        let archive_bytes = doc.to_book_archive_bytes().unwrap();
+        assert!(!archive_bytes.is_empty());
+        let mem_loaded = BookDocument::from_book_archive_bytes(&archive_bytes).unwrap();
+        assert_eq!(mem_loaded.metadata.title, "Cross-Platform Test Book");
+        assert_eq!(
+            mem_loaded.asset_bytes.get("cover_img").unwrap(),
+            &vec![137, 80, 78, 71]
+        );
+        assert_eq!(mem_loaded.threaded_frames_for_story(story_id).len(), 2);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-name: Build macOS (M1 Air) & Linux Binaries
+name: Build WebAssembly (GitHub Pages), macOS (M1 Air) & Linux
 
 on:
   push:
@@ -6,7 +6,53 @@ on:
     tags: [ 'v*' ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
 jobs:
+  build-and-deploy-pages:
+    name: Build WebAssembly & Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain (wasm32-unknown-unknown)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      - name: Build WebAssembly Bundle with Trunk
+        run: |
+          trunk build --release --public-url ./
+          touch dist/.nojekyll
+
+      - name: Upload GitHub Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
   build-macos-m1:
     name: Build macOS Apple Silicon (M1 Air) .app
     runs-on: macos-14

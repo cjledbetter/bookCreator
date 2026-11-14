@@ -16,5 +16,26 @@ book-epub = { path = "../book-epub" }
 book-help = { path = "../book-help" }
 eframe.workspace = true
 egui.workspace = true
-rfd.workspace = true
 uuid.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rfd.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Window",
+    "HtmlCanvasElement",
+    "HtmlAnchorElement",
+    "HtmlElement",
+    "Element",
+    "Node",
+    "Url",
+    "Blob",
+    "BlobPropertyBag",
+] }
+js-sys = "0.3"
+log = "0.4"

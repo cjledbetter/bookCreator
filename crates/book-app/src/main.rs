@@ -18,7 +18,7 @@ use book_epub::EpubLayoutMode;
 use book_help::{create_tutorial_book, run_preflight};
 use book_layout::ComputedBookLayout;
 use eframe::egui;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::canvas::CanvasInteractionState;
@@ -38,6 +38,7 @@ pub enum Tool {
     LinkText,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -56,6 +57,86 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(BookCreatorApp::new()))
         }),
     )
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    use wasm_bindgen::JsCast as _;
+
+    eframe::WebLogger::init(log::LevelFilter::Debug).ok();
+    let web_options = eframe::WebOptions::default();
+
+    wasm_bindgen_futures::spawn_local(async {
+        let document = web_sys::window()
+            .expect("No browser window")
+            .document()
+            .expect("No browser document");
+
+        let canvas = document
+            .get_element_by_id("the_canvas_id")
+            .expect("Failed to find #the_canvas_id")
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .expect("#the_canvas_id was not a HtmlCanvasElement");
+
+        let start_result = eframe::WebRunner::new()
+            .start(
+                canvas,
+                web_options,
+                Box::new(|cc| {
+                    configure_studio_visuals(&cc.egui_ctx);
+                    Ok(Box::new(BookCreatorApp::new()))
+                }),
+            )
+            .await;
+
+        if let Some(loading_el) = document.get_element_by_id("loading_text") {
+            match start_result {
+                Ok(_) => {
+                    loading_el.remove();
+                }
+                Err(e) => {
+                    loading_el.set_inner_html(
+                        "<p>Failed to start Book Creator WebGL canvas. Please ensure WebGL2 is enabled.</p>",
+                    );
+                    log::error!("Failed to start eframe: {e:?}");
+                }
+            }
+        }
+    });
+}
+
+/// Build a clean cross-platform filename slug from a book title and file extension.
+pub fn default_filename_for_title(title: &str, ext: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in title.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if (ch.is_whitespace() || ch == '-' || ch == '_') && !slug.is_empty() && !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-');
+    let base = if slug.is_empty() { "my-book" } else { slug };
+    let clean_ext = ext.trim_start_matches('.');
+    format!("{base}.{clean_ext}")
+}
+
+/// Ensure `filename` ends with `.{ext}`.
+pub fn ensure_extension(filename: &str, ext: &str) -> String {
+    let clean_ext = ext.trim_start_matches('.');
+    let trimmed = filename.trim();
+    if trimmed.is_empty() {
+        return format!("my-book.{clean_ext}");
+    }
+    let suffix = format!(".{clean_ext}");
+    if trimmed.to_ascii_lowercase().ends_with(&suffix.to_ascii_lowercase()) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}{suffix}")
+    }
 }
 
 fn configure_studio_visuals(ctx: &egui::Context) {
@@ -90,6 +171,9 @@ pub struct BookCreatorApp {
     pub pdf_include_crop_marks: bool,
     pub epub_layout_mode: EpubLayoutMode,
     pub cover_paper_stock: PaperStock,
+    pub current_project_path: Option<PathBuf>,
+    pub save_as_filename: String,
+    pub show_save_as_modal: bool,
     pub status_message: String,
     pub canvas_interaction: CanvasInteractionState,
 }
@@ -103,6 +187,7 @@ impl Default for BookCreatorApp {
 impl BookCreatorApp {
     pub fn new() -> Self {
         let doc = create_tutorial_book();
+        let save_as_filename = default_filename_for_title(&doc.metadata.title, "book");
         let layout = ComputedBookLayout::compute(&doc);
         let preflight_issues = run_preflight(&doc, &layout);
         Self {
@@ -128,6 +213,9 @@ impl BookCreatorApp {
             pdf_include_crop_marks: true,
             epub_layout_mode: EpubLayoutMode::FixedLayout,
             cover_paper_stock: PaperStock::White,
+            current_project_path: None,
+            save_as_filename,
+            show_save_as_modal: false,
             status_message:
                 "Loaded 4-Page Interactive Starter Tutorial Book. Drag elements or press F1 for Help Manual."
                     .to_string(),
@@ -186,6 +274,8 @@ impl BookCreatorApp {
         self.selected_frame_id = None;
         self.editing_text_frame_id = None;
         self.link_source_frame_id = None;
+        self.current_project_path = None;
+        self.save_as_filename = default_filename_for_title(&self.doc.metadata.title, "book");
         self.recompute_layout_and_preflight();
         self.status_message = "Created new blank book project.".to_string();
     }
@@ -197,8 +287,91 @@ impl BookCreatorApp {
         self.selected_frame_id = None;
         self.editing_text_frame_id = None;
         self.link_source_frame_id = None;
+        self.current_project_path = None;
+        self.save_as_filename = default_filename_for_title(&self.doc.metadata.title, "book");
         self.recompute_layout_and_preflight();
         self.status_message = "Loaded 4-Page Interactive Starter Tutorial Book.".to_string();
+    }
+
+    /// Save the project to an explicit path (`.book` archive or `.bookdir` directory)
+    /// and record `current_project_path` + `save_as_filename` for subsequent `Save` (`Ctrl+S` / `Cmd+S`) calls.
+    pub fn save_project_as_path(&mut self, path: impl AsRef<Path>) -> Result<PathBuf, String> {
+        let raw_path = path.as_ref();
+        let is_bookdir = raw_path.is_dir()
+            || raw_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map_or(false, |e| e.eq_ignore_ascii_case("bookdir"));
+
+        if is_bookdir {
+            let final_path = raw_path.to_path_buf();
+            self.doc
+                .save_book_directory(&final_path)
+                .map_err(|e| e.to_string())?;
+            self.current_project_path = Some(final_path.clone());
+            self.status_message =
+                format!("Saved Git-friendly .bookdir to '{}'", final_path.display());
+            Ok(final_path)
+        } else {
+            let mut final_path = raw_path.to_path_buf();
+            if final_path.extension().is_none() {
+                final_path.set_extension("book");
+            }
+            self.doc
+                .save_book_archive(&final_path)
+                .map_err(|e| e.to_string())?;
+            if let Some(fname) = final_path.file_name().and_then(|s| s.to_str()) {
+                self.save_as_filename = fname.to_string();
+            }
+            self.current_project_path = Some(final_path.clone());
+            self.status_message = format!("Saved portable .book to '{}'", final_path.display());
+            Ok(final_path)
+        }
+    }
+
+    /// Save the active project (`Ctrl+S` / `Cmd+S`):
+    /// - On Desktop: if `current_project_path` is `Some(path)`, saves directly in-place without popping a dialog;
+    ///   otherwise opens the `Save As...` file dialog.
+    /// - On WebAssembly: serializes `doc.to_book_archive_bytes()` and triggers an instant browser `.book` download.
+    pub fn save_project(&mut self) -> Result<String, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(existing_path) = self.current_project_path.clone() {
+                let saved = self.save_project_as_path(&existing_path)?;
+                return Ok(saved.display().to_string());
+            }
+            toolbar::save_book_archive_as_dialog(self);
+            if let Some(ref p) = self.current_project_path {
+                Ok(p.display().to_string())
+            } else {
+                Err("Cancelled".to_string())
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let filename = if self.save_as_filename.trim().is_empty() {
+                default_filename_for_title(&self.doc.metadata.title, "book")
+            } else {
+                ensure_extension(&self.save_as_filename, "book")
+            };
+            self.save_as_filename = filename.clone();
+            let bytes = self
+                .doc
+                .to_book_archive_bytes()
+                .map_err(|e| e.to_string())?;
+            let saved = toolbar::save_or_download_bytes(
+                &filename,
+                "Book Project (.book)",
+                "book",
+                &bytes,
+            )?;
+            self.status_message = format!(
+                "Downloaded portable .book archive '{saved}' ({} bytes).",
+                bytes.len()
+            );
+            Ok(saved)
+        }
     }
 
     pub fn fit_page_in_viewport(&mut self) {
@@ -633,64 +806,7 @@ impl BookCreatorApp {
     }
 
     fn handle_os_dropped_files(&mut self, ctx: &egui::Context) {
-        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
-        if dropped.is_empty() {
-            return;
-        }
-
-        for file in dropped {
-            if let Some(ref path) = file.path {
-                let ext = path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                if ext == "book" {
-                    if let Ok(loaded) = BookDocument::load_book_archive(path) {
-                        self.record_undo_snapshot();
-                        self.doc = loaded;
-                        self.current_page = 0;
-                        self.selected_frame_id = None;
-                        self.recompute_layout_and_preflight();
-                        self.status_message = format!("Opened dropped project '{}'", path.display());
-                    }
-                    continue;
-                } else if ext == "bookdir" || path.is_dir() {
-                    if let Ok(loaded) = BookDocument::load_book_directory(path) {
-                        self.record_undo_snapshot();
-                        self.doc = loaded;
-                        self.current_page = 0;
-                        self.selected_frame_id = None;
-                        self.recompute_layout_and_preflight();
-                        self.status_message =
-                            format!("Opened dropped .bookdir '{}'", path.display());
-                    }
-                    continue;
-                } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "svg") {
-                    if let Ok(bytes) = std::fs::read(path) {
-                        let filename = path
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("dropped_image.png");
-                        let target_img_frame = self.selected_frame_id.filter(|&sel_id| {
-                            self.doc
-                                .pages
-                                .get(self.current_page)
-                                .and_then(|p| p.frames.iter().find(|f| f.id == sel_id))
-                                .map_or(false, |f| matches!(f.kind, FrameKind::Image { .. }))
-                        });
-                        self.import_image_bytes_into_doc(filename, bytes, target_img_frame, None);
-                    }
-                }
-            } else if let Some(ref bytes) = file.bytes {
-                let name = if file.name.is_empty() {
-                    "dropped_image.png"
-                } else {
-                    &file.name
-                };
-                self.import_image_bytes_into_doc(name, bytes.to_vec(), None, None);
-            }
-        }
+        canvas::handle_dropped_files(self, ctx);
     }
 }
 
@@ -710,6 +826,7 @@ impl eframe::App for BookCreatorApp {
 
         help_drawer::show_help_manual_window(self, ctx);
         help_drawer::show_preflight_window(self, ctx);
+        toolbar::show_save_as_modal_window(self, ctx);
     }
 }
 
@@ -872,5 +989,45 @@ mod tests {
         assert_eq!(app.current_page, 5);
         assert_eq!(app.doc.pages[5].master_id, None);
         assert!(app.preflight_issues.is_empty());
+    }
+
+    #[test]
+    fn save_and_save_as_roundtrip_tracks_current_project_path() {
+        let mut app = BookCreatorApp::new();
+        assert!(app.current_project_path.is_none());
+        assert!(app.save_as_filename.ends_with(".book"));
+
+        let unique_dir = std::env::temp_dir().join(format!(
+            "book_creator_save_test_{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&unique_dir).unwrap();
+
+        // 1. "Save As" to a path without extension automatically adds `.book` and sets `current_project_path`
+        let save_as_target = unique_dir.join("first-edition");
+        let saved_path = app.save_project_as_path(&save_as_target).unwrap();
+        assert_eq!(saved_path, unique_dir.join("first-edition.book"));
+        assert_eq!(app.current_project_path, Some(saved_path.clone()));
+        assert_eq!(app.save_as_filename, "first-edition.book");
+        assert!(saved_path.exists());
+
+        // 2. Modify the document and invoke `save_project()` (Ctrl+S / Cmd+S) — saves in-place to `current_project_path`
+        app.doc.metadata.title = "Updated In-Place Edition".to_string();
+        app.add_page();
+        let expected_pages = app.doc.pages.len();
+        let in_place_result = app.save_project().unwrap();
+        assert_eq!(in_place_result, saved_path.display().to_string());
+
+        let reloaded = BookDocument::load_book_archive(&saved_path).unwrap();
+        assert_eq!(reloaded.metadata.title, "Updated In-Place Edition");
+        assert_eq!(reloaded.pages.len(), expected_pages);
+
+        // 3. "Save As" to a second `.book` file updates `current_project_path` and `save_as_filename`
+        let second_target = unique_dir.join("second-edition.book");
+        let saved_second = app.save_project_as_path(&second_target).unwrap();
+        assert_eq!(app.current_project_path, Some(saved_second.clone()));
+        assert_eq!(app.save_as_filename, "second-edition.book");
+
+        let _ = std::fs::remove_dir_all(&unique_dir);
     }
 }

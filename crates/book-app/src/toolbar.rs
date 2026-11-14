@@ -3,17 +3,18 @@
 //! & Master Page Rail with miniature visual frame thumbnails.
 
 use book_core::{BookDocument, FrameKind, PagePreset, PaperStock, PreflightSeverity, ShapeKind};
-use book_epub::{export_epub_to_file, EpubLayoutMode};
+use book_epub::{export_epub_bytes, EpubLayoutMode};
 use book_help::primary_modifier_label;
-use book_pdf::{export_pdf_to_file, PdfExportOptions};
+use book_pdf::{export_pdf_bytes, PdfExportOptions};
 use eframe::egui;
 
 use crate::canvas::to_color32;
-use crate::{BookCreatorApp, Tool};
+use crate::{default_filename_for_title, ensure_extension, BookCreatorApp, Tool};
 
 /// Render the top studio toolbar and process global keyboard shortcuts.
 pub fn show_top_toolbar(app: &mut BookCreatorApp, ctx: &egui::Context) {
     process_keyboard_shortcuts(app, ctx);
+    let mod_key = primary_modifier_label();
 
     egui::TopBottomPanel::top("top_studio_toolbar")
         .exact_height(46.0)
@@ -23,7 +24,7 @@ pub fn show_top_toolbar(app: &mut BookCreatorApp, ctx: &egui::Context) {
 
                 // --- 1. File Actions Menu & Quick Buttons ---
                 ui.menu_button("📁 File", |ui| {
-                    ui.set_min_width(210.0);
+                    ui.set_min_width(250.0);
                     if ui.button("📄 New Blank Book").clicked() {
                         app.new_blank_book();
                         ui.close_menu();
@@ -39,22 +40,39 @@ pub fn show_top_toolbar(app: &mut BookCreatorApp, ctx: &egui::Context) {
                     ui.separator();
                     if ui
                         .button("📂 Open .book Archive...")
-                        .on_hover_text("Open a portable single-file .book archive")
+                        .on_hover_text("Open a portable single-file .book archive (or drag & drop a .book file onto the window)")
                         .clicked()
                     {
                         ui.close_menu();
                         open_book_archive_dialog(app);
                     }
                     if ui
-                        .button("💾 Save .book Archive...")
-                        .on_hover_text("Save portable single-file .book archive (Mac M1 Air & Arch Linux)")
+                        .button(format!("💾 Save ({mod_key}+S)"))
+                        .on_hover_text("Save current project in-place (or download .book in browser)")
                         .clicked()
                     {
                         ui.close_menu();
-                        save_book_archive_dialog(app);
+                        let _ = app.save_project();
                     }
                     if ui
-                        .button("🗂 Save .bookdir Folder (Git-friendly)...")
+                        .button(format!("💾 Save As .book... ({mod_key}+Shift+S)"))
+                        .on_hover_text("Save portable single-file .book archive under a new name/path")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        trigger_save_as_action(app);
+                    }
+                    if ui
+                        .button("✏ Save Project As (Custom Filename)...")
+                        .on_hover_text("Choose custom filename to download/save .book, .pdf, or .epub")
+                        .clicked()
+                    {
+                        ui.close_menu();
+                        app.show_save_as_modal = true;
+                    }
+                    ui.separator();
+                    if ui
+                        .button("🗂 Save As .bookdir Folder (Git-friendly)...")
                         .on_hover_text("Save unpacked .bookdir directory for Git version control")
                         .clicked()
                     {
@@ -72,6 +90,16 @@ pub fn show_top_toolbar(app: &mut BookCreatorApp, ctx: &egui::Context) {
                 });
 
                 if ui
+                    .button("💾 Save")
+                    .on_hover_text(format!(
+                        "Save Project ({mod_key}+S) — or use File ▸ Save As ({mod_key}+Shift+S)"
+                    ))
+                    .clicked()
+                {
+                    let _ = app.save_project();
+                }
+
+                if ui
                     .button("🎓 Tutorial")
                     .on_hover_text("Reset / Reload the 4-Page Interactive Starter Tutorial Book")
                     .clicked()
@@ -80,7 +108,6 @@ pub fn show_top_toolbar(app: &mut BookCreatorApp, ctx: &egui::Context) {
                 }
 
                 // --- 2. Undo / Redo ---
-                let mod_key = primary_modifier_label();
                 if ui
                     .add_enabled(app.history.can_undo(), egui::Button::new("↶ Undo"))
                     .on_hover_text(format!("Undo ({mod_key}+Z)"))
@@ -691,13 +718,23 @@ fn process_keyboard_shortcuts(app: &mut BookCreatorApp, ctx: &egui::Context) {
         app.show_help = !app.show_help;
     }
 
+    let modifiers = ctx.input(|i| i.modifiers);
+    let cmd_or_ctrl = modifiers.command || modifiers.ctrl;
+
+    // Ctrl+S / Cmd+S (Save) and Ctrl+Shift+S / Cmd+Shift+S (Save As...) work globally
+    if cmd_or_ctrl && ctx.input(|i| i.key_pressed(egui::Key::S)) {
+        if modifiers.shift {
+            trigger_save_as_action(app);
+        } else {
+            let _ = app.save_project();
+        }
+        return;
+    }
+
     // Do not intercept single-letter tool shortcuts while typing in a text field
     if ctx.wants_keyboard_input() {
         return;
     }
-
-    let modifiers = ctx.input(|i| i.modifiers);
-    let cmd_or_ctrl = modifiers.command || modifiers.ctrl;
 
     if cmd_or_ctrl && ctx.input(|i| i.key_pressed(egui::Key::Z)) {
         if modifiers.shift {
@@ -733,7 +770,204 @@ fn process_keyboard_shortcuts(app: &mut BookCreatorApp, ctx: &egui::Context) {
     }
 }
 
+/// Trigger "Save As..." — opens native file dialog on Desktop or the Save As modal on WebAssembly.
+pub fn trigger_save_as_action(app: &mut BookCreatorApp) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        save_book_archive_as_dialog(app);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        if app.save_as_filename.trim().is_empty() {
+            app.save_as_filename = default_filename_for_title(&app.doc.metadata.title, "book");
+        }
+        app.show_save_as_modal = true;
+    }
+}
+
+/// Render the in-app "Save Project As..." modal window (available on WebAssembly and Desktop).
+pub fn show_save_as_modal_window(app: &mut BookCreatorApp, ctx: &egui::Context) {
+    if !app.show_save_as_modal {
+        return;
+    }
+
+    let mut open = app.show_save_as_modal;
+    let mut action_book = false;
+    let mut action_pdf = false;
+    let mut action_epub = false;
+    let mut close_requested = false;
+
+    egui::Window::new("💾 Save Project As...")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(380.0)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.label(
+                "Enter a filename for your portable .book bundle or exported publication:",
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Filename:");
+                ui.text_edit_singleline(&mut app.save_as_filename);
+            });
+            ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .button(egui::RichText::new("💾 Download .book").strong())
+                    .on_hover_text("Save or download portable .book archive with this filename")
+                    .clicked()
+                {
+                    action_book = true;
+                }
+                if ui
+                    .button("🖨 Export PDF")
+                    .on_hover_text("Export print-ready PDF with this filename")
+                    .clicked()
+                {
+                    action_pdf = true;
+                }
+                if ui
+                    .button("📖 Export EPUB 3")
+                    .on_hover_text("Export EPUB 3.3 eBook with this filename")
+                    .clicked()
+                {
+                    action_epub = true;
+                }
+                if ui.button("Cancel").clicked() {
+                    close_requested = true;
+                }
+            });
+        });
+
+    if action_book {
+        let filename = ensure_extension(&app.save_as_filename, "book");
+        app.save_as_filename = filename.clone();
+        match app.doc.to_book_archive_bytes() {
+            Ok(bytes) => {
+                match save_or_download_bytes(&filename, "Book Project (.book)", "book", &bytes) {
+                    Ok(saved_target) => {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            app.current_project_path =
+                                Some(std::path::PathBuf::from(&saved_target));
+                        }
+                        app.status_message = format!("Saved portable .book to '{saved_target}'");
+                    }
+                    Err(err) if err != "Cancelled" => {
+                        app.status_message = format!("Failed to save .book: {err}");
+                    }
+                    _ => {}
+                }
+            }
+            Err(err) => {
+                app.status_message = format!("Failed to serialize .book: {err}");
+            }
+        }
+        open = false;
+    } else if action_pdf {
+        export_pdf_dialog(app);
+        open = false;
+    } else if action_epub {
+        export_epub_dialog(app);
+        open = false;
+    } else if close_requested {
+        open = false;
+    }
+
+    app.show_save_as_modal = open;
+}
+
+/// Cross-platform byte saver:
+/// - On native desktop (`not(target_arch = "wasm32")`): opens `rfd::FileDialog` and writes `bytes` to disk.
+/// - On WebAssembly (`target_arch = "wasm32"`): creates a `js_sys::Uint8Array`, wraps it in a `web_sys::Blob`,
+///   creates an object URL, clicks a temporary `<a download="...">` element to trigger an instant browser download,
+///   and revokes the URL.
+pub fn save_or_download_bytes(
+    default_filename: &str,
+    filter_name: &str,
+    ext: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let filename = ensure_extension(default_filename, ext);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let Some(mut path) = rfd::FileDialog::new()
+            .set_file_name(&filename)
+            .add_filter(filter_name, &[ext])
+            .save_file()
+        else {
+            return Err("Cancelled".to_string());
+        };
+        if path.extension().is_none() {
+            path.set_extension(ext);
+        }
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        Ok(path.display().to_string())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = filter_name;
+        let mime_type = match ext {
+            "pdf" => "application/pdf",
+            "epub" => "application/epub+zip",
+            "book" => "application/zip",
+            _ => "application/octet-stream",
+        };
+        trigger_browser_download(&filename, mime_type, bytes)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn trigger_browser_download(
+    filename: &str,
+    mime_type: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    use wasm_bindgen::JsCast as _;
+
+    let window = web_sys::window().ok_or_else(|| "No browser window".to_string())?;
+    let document = window
+        .document()
+        .ok_or_else(|| "No browser document".to_string())?;
+
+    let uint8_array = js_sys::Uint8Array::from(bytes);
+    let blob_parts = js_sys::Array::new();
+    blob_parts.push(&uint8_array);
+
+    let options = web_sys::BlobPropertyBag::new();
+    options.set_type(mime_type);
+
+    let blob = web_sys::Blob::new_with_u8_array_sequence_and_options(&blob_parts, &options)
+        .map_err(|e| format!("Failed to create Blob: {e:?}"))?;
+
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|e| format!("Failed to create Object URL: {e:?}"))?;
+
+    let elem = document
+        .create_element("a")
+        .map_err(|e| format!("Failed to create anchor element: {e:?}"))?;
+    let anchor = elem
+        .dyn_into::<web_sys::HtmlAnchorElement>()
+        .map_err(|_| "Element is not an HtmlAnchorElement".to_string())?;
+
+    anchor.set_href(&url);
+    anchor.set_download(filename);
+    if let Some(body) = document.body() {
+        let _ = body.append_child(&anchor);
+    }
+    anchor.click();
+    anchor.remove();
+
+    let _ = web_sys::Url::revoke_object_url(&url);
+    Ok(filename.to_string())
+}
+
 pub fn open_book_archive_dialog(app: &mut BookCreatorApp) {
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(path) = rfd::FileDialog::new()
         .add_filter("Book Project (.book)", &["book"])
         .pick_file()
@@ -744,6 +978,11 @@ pub fn open_book_archive_dialog(app: &mut BookCreatorApp) {
                 app.doc = doc;
                 app.current_page = 0;
                 app.selected_frame_id = None;
+                app.editing_text_frame_id = None;
+                app.current_project_path = Some(path.clone());
+                if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
+                    app.save_as_filename = fname.to_string();
+                }
                 app.recompute_layout_and_preflight();
                 app.status_message = format!("Opened '{}'", path.display());
             }
@@ -752,32 +991,54 @@ pub fn open_book_archive_dialog(app: &mut BookCreatorApp) {
             }
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        app.status_message =
+            "Tip (Web): Drag and drop any .book project archive directly from your computer onto this browser window!"
+                .to_string();
+    }
 }
 
 pub fn save_book_archive_dialog(app: &mut BookCreatorApp) {
-    if let Some(path) = rfd::FileDialog::new()
+    save_book_archive_as_dialog(app);
+}
+
+pub fn save_book_archive_as_dialog(app: &mut BookCreatorApp) {
+    let default_name = if app.save_as_filename.trim().is_empty() {
+        default_filename_for_title(&app.doc.metadata.title, "book")
+    } else {
+        ensure_extension(&app.save_as_filename, "book")
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(mut path) = rfd::FileDialog::new()
         .add_filter("Book Project (.book)", &["book"])
-        .set_file_name("project.book")
+        .set_file_name(&default_name)
         .save_file()
     {
-        match app.doc.save_book_archive(&path) {
-            Ok(()) => {
-                app.status_message = format!("Saved portable .book to '{}'", path.display());
-            }
-            Err(err) => {
-                app.status_message = format!("Failed to save .book: {err}");
-            }
+        if path.extension().is_none() {
+            path.set_extension("book");
         }
+        let _ = app.save_project_as_path(&path);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        app.save_as_filename = default_name;
+        app.show_save_as_modal = true;
     }
 }
 
 pub fn save_bookdir_dialog(app: &mut BookCreatorApp) {
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(folder) = rfd::FileDialog::new()
         .set_file_name("project.bookdir")
         .save_file()
     {
         match app.doc.save_book_directory(&folder) {
             Ok(()) => {
+                app.current_project_path = Some(folder.clone());
                 app.status_message =
                     format!("Saved Git-friendly .bookdir to '{}'", folder.display());
             }
@@ -786,9 +1047,17 @@ pub fn save_bookdir_dialog(app: &mut BookCreatorApp) {
             }
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        app.status_message =
+            "In the web browser, use 'Save' or 'Save As .book' to download a single-file portable .book archive."
+                .to_string();
+    }
 }
 
 pub fn open_bookdir_dialog(app: &mut BookCreatorApp) {
+    #[cfg(not(target_arch = "wasm32"))]
     if let Some(folder) = rfd::FileDialog::new().pick_folder() {
         match BookDocument::load_book_directory(&folder) {
             Ok(doc) => {
@@ -796,6 +1065,8 @@ pub fn open_bookdir_dialog(app: &mut BookCreatorApp) {
                 app.doc = doc;
                 app.current_page = 0;
                 app.selected_frame_id = None;
+                app.editing_text_frame_id = None;
+                app.current_project_path = Some(folder.clone());
                 app.recompute_layout_and_preflight();
                 app.status_message = format!("Opened .bookdir '{}'", folder.display());
             }
@@ -804,52 +1075,80 @@ pub fn open_bookdir_dialog(app: &mut BookCreatorApp) {
             }
         }
     }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        app.status_message =
+            "Tip (Web): Drag and drop a .book archive onto the browser window to open a project!"
+                .to_string();
+    }
 }
 
 pub fn export_pdf_dialog(app: &mut BookCreatorApp) {
-    if let Some(path) = rfd::FileDialog::new()
-        .add_filter("Print-Ready PDF (.pdf)", &["pdf"])
-        .set_file_name("book-print.pdf")
-        .save_file()
-    {
-        let options = PdfExportOptions {
-            include_bleed: app.pdf_include_bleed,
-            include_crop_marks: app.pdf_include_crop_marks,
-        };
-        match export_pdf_to_file(&app.doc, &app.layout, options, &path) {
-            Ok(()) => {
-                app.status_message = format!(
-                    "Exported Print PDF (bleed={}, crop_marks={}) to '{}'",
-                    options.include_bleed,
-                    options.include_crop_marks,
-                    path.display()
-                );
+    let options = PdfExportOptions {
+        include_bleed: app.pdf_include_bleed,
+        include_crop_marks: app.pdf_include_crop_marks,
+    };
+    let stem = app
+        .save_as_filename
+        .strip_suffix(".book")
+        .unwrap_or(&app.save_as_filename);
+    let default_pdf = if stem.trim().is_empty() {
+        default_filename_for_title(&app.doc.metadata.title, "pdf")
+    } else {
+        ensure_extension(stem, "pdf")
+    };
+
+    match export_pdf_bytes(&app.doc, &app.layout, options) {
+        Ok(bytes) => {
+            match save_or_download_bytes(&default_pdf, "Print-Ready PDF (.pdf)", "pdf", &bytes) {
+                Ok(dest) => {
+                    app.status_message = format!(
+                        "Exported Print PDF (bleed={}, crop_marks={}) to '{}'",
+                        options.include_bleed, options.include_crop_marks, dest
+                    );
+                }
+                Err(err) if err != "Cancelled" => {
+                    app.status_message = format!("PDF save error: {err}");
+                }
+                _ => {}
             }
-            Err(err) => {
-                app.status_message = format!("PDF export error: {err}");
-            }
+        }
+        Err(err) => {
+            app.status_message = format!("PDF export error: {err}");
         }
     }
 }
 
 pub fn export_epub_dialog(app: &mut BookCreatorApp) {
-    if let Some(path) = rfd::FileDialog::new()
-        .add_filter("EPUB 3.3 eBook (.epub)", &["epub"])
-        .set_file_name("book.epub")
-        .save_file()
-    {
-        match export_epub_to_file(&app.doc, &app.layout, app.epub_layout_mode, &path) {
-            Ok(()) => {
-                let mode_str = match app.epub_layout_mode {
-                    EpubLayoutMode::FixedLayout => "Fixed-Layout",
-                    EpubLayoutMode::Reflowable => "Reflowable",
-                };
-                app.status_message =
-                    format!("Exported {mode_str} EPUB 3.3 to '{}'", path.display());
+    let stem = app
+        .save_as_filename
+        .strip_suffix(".book")
+        .unwrap_or(&app.save_as_filename);
+    let default_epub = if stem.trim().is_empty() {
+        default_filename_for_title(&app.doc.metadata.title, "epub")
+    } else {
+        ensure_extension(stem, "epub")
+    };
+
+    match export_epub_bytes(&app.doc, &app.layout, app.epub_layout_mode) {
+        Ok(bytes) => {
+            match save_or_download_bytes(&default_epub, "EPUB 3.3 eBook (.epub)", "epub", &bytes) {
+                Ok(dest) => {
+                    let mode_str = match app.epub_layout_mode {
+                        EpubLayoutMode::FixedLayout => "Fixed-Layout",
+                        EpubLayoutMode::Reflowable => "Reflowable",
+                    };
+                    app.status_message = format!("Exported {mode_str} EPUB 3.3 to '{dest}'");
+                }
+                Err(err) if err != "Cancelled" => {
+                    app.status_message = format!("EPUB save error: {err}");
+                }
+                _ => {}
             }
-            Err(err) => {
-                app.status_message = format!("EPUB export error: {err}");
-            }
+        }
+        Err(err) => {
+            app.status_message = format!("EPUB export error: {err}");
         }
     }
 }

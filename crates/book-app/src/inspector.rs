@@ -507,6 +507,7 @@ fn show_selected_frame_inspector(app: &mut BookCreatorApp, ui: &mut egui::Ui, se
             "Link Mode: Click another Text Frame to thread overflow story.".to_string();
     }
     if import_image_clicked {
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Images", &["png", "jpg", "jpeg", "webp", "svg"])
             .pick_file()
@@ -519,6 +520,12 @@ fn show_selected_frame_inspector(app: &mut BookCreatorApp, ui: &mut egui::Ui, se
                     .to_string();
                 app.import_image_bytes_into_doc(&filename, bytes, Some(sel_id), None);
             }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            app.status_message =
+                "Tip (Web): Drag and drop a PNG, JPG, WEBP, or SVG file directly onto the browser window to import it into the selected Image Frame!"
+                    .to_string();
         }
     }
     if layout_dirty {

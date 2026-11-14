@@ -1419,3 +1419,119 @@ fn draw_dashed_rect(
         }
     }
 }
+
+/// Process OS or Browser drag-and-drop files (`.book`, `.bookdir`, `.png`, `.jpg`, `.webp`, `.svg`).
+/// Supports both `file.path` on native desktop (Arch Linux / Mac M1 Air) and `file.bytes` on
+/// WebAssembly / GitHub Pages when dragging files into the browser window.
+pub fn handle_dropped_files(app: &mut BookCreatorApp, ctx: &egui::Context) {
+    let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+    if dropped.is_empty() {
+        return;
+    }
+
+    for file in dropped {
+        if let Some(ref path) = file.path.as_ref().filter(|p| !p.as_os_str().is_empty()) {
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if ext == "book" {
+                match BookDocument::load_book_archive(path) {
+                    Ok(loaded) => {
+                        app.record_undo_snapshot();
+                        app.doc = loaded;
+                        app.current_page = 0;
+                        app.selected_frame_id = None;
+                        app.editing_text_frame_id = None;
+                        app.current_project_path = Some((*path).clone());
+                        if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
+                            app.save_as_filename = fname.to_string();
+                        }
+                        app.recompute_layout_and_preflight();
+                        app.status_message = format!("Opened dropped project '{}'", path.display());
+                    }
+                    Err(err) => {
+                        app.status_message = format!("Failed to open dropped .book: {err}");
+                    }
+                }
+                continue;
+            } else if ext == "bookdir" || path.is_dir() {
+                match BookDocument::load_book_directory(path) {
+                    Ok(loaded) => {
+                        app.record_undo_snapshot();
+                        app.doc = loaded;
+                        app.current_page = 0;
+                        app.selected_frame_id = None;
+                        app.editing_text_frame_id = None;
+                        app.current_project_path = Some((*path).clone());
+                        app.recompute_layout_and_preflight();
+                        app.status_message =
+                            format!("Opened dropped .bookdir '{}'", path.display());
+                    }
+                    Err(err) => {
+                        app.status_message = format!("Failed to open dropped .bookdir: {err}");
+                    }
+                }
+                continue;
+            } else if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "svg") {
+                if let Ok(bytes) = std::fs::read(path) {
+                    let filename = path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("dropped_image.png");
+                    let target_img_frame = app.selected_frame_id.filter(|&sel_id| {
+                        app.doc
+                            .pages
+                            .get(app.current_page)
+                            .and_then(|p| p.frames.iter().find(|f| f.id == sel_id))
+                            .map_or(false, |f| matches!(f.kind, FrameKind::Image { .. }))
+                    });
+                    app.import_image_bytes_into_doc(filename, bytes, target_img_frame, None);
+                }
+            }
+        } else if let Some(ref bytes) = file.bytes {
+            let name = if file.name.is_empty() {
+                "dropped_image.png"
+            } else {
+                &file.name
+            };
+            let ext = std::path::Path::new(name)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+
+            if ext == "book" {
+                match BookDocument::from_book_archive_bytes(bytes) {
+                    Ok(loaded) => {
+                        app.record_undo_snapshot();
+                        app.doc = loaded;
+                        app.current_page = 0;
+                        app.selected_frame_id = None;
+                        app.editing_text_frame_id = None;
+                        app.current_project_path = None;
+                        app.save_as_filename = name.to_string();
+                        app.recompute_layout_and_preflight();
+                        app.status_message = format!(
+                            "Opened dropped .book archive '{name}' ({} bytes)",
+                            bytes.len()
+                        );
+                    }
+                    Err(err) => {
+                        app.status_message = format!("Failed to open dropped .book '{name}': {err}");
+                    }
+                }
+            } else {
+                let target_img_frame = app.selected_frame_id.filter(|&sel_id| {
+                    app.doc
+                        .pages
+                        .get(app.current_page)
+                        .and_then(|p| p.frames.iter().find(|f| f.id == sel_id))
+                        .map_or(false, |f| matches!(f.kind, FrameKind::Image { .. }))
+                });
+                app.import_image_bytes_into_doc(name, bytes.to_vec(), target_img_frame, None);
+            }
+        }
+    }
+}
