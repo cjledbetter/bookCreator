@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.book
+*.bookdir/
+*.pdf
+*.epub
+.DS_Store

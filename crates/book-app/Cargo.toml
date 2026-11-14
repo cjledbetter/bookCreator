@@ -1,0 +1,20 @@
+[package]
+name = "book-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "book-creator"
+path = "src/main.rs"
+
+[dependencies]
+book-core = { path = "../book-core" }
+book-layout = { path = "../book-layout" }
+book-pdf = { path = "../book-pdf" }
+book-epub = { path = "../book-epub" }
+book-help = { path = "../book-help" }
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+uuid.workspace = true
