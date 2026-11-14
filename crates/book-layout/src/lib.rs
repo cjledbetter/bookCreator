@@ -140,6 +140,9 @@ pub fn font_family_width_factor(font_family: &str) -> f32 {
     }
 }
 
+/// Hard upper bound on lines placed in a single text frame to prevent UI freezes on pathological input.
+pub const MAX_LINES_PER_FRAME: usize = 2_000;
+
 /// Estimates the typographic advance width in points (`pt`) of a single character
 /// using proportional ASCII/Unicode character-class metrics and style multipliers.
 pub fn estimate_char_width_pt(
@@ -149,7 +152,11 @@ pub fn estimate_char_width_pt(
     bold: bool,
     italic: bool,
 ) -> f32 {
-    let size = font_size_pt.max(1.0);
+    let size = if font_size_pt.is_finite() {
+        font_size_pt.clamp(1.0, 1_000.0)
+    } else {
+        12.0
+    };
     if matches!(ch, '\n' | '\r' | '\0') {
         return 0.0;
     }
@@ -258,8 +265,21 @@ impl ComputedBookLayout {
             .map(|page| {
                 page.frames
                     .iter()
-                    .filter(|f| f.wrap.mode != WrapMode::None)
-                    .map(|f| (f.id, f.rect.expand(f.wrap.padding_pt.max(0.0)), f.wrap.mode))
+                    .filter(|f| {
+                        f.wrap.mode != WrapMode::None
+                            && f.rect.x.is_finite()
+                            && f.rect.y.is_finite()
+                            && f.rect.width.is_finite()
+                            && f.rect.height.is_finite()
+                    })
+                    .map(|f| {
+                        let pad = if f.wrap.padding_pt.is_finite() {
+                            f.wrap.padding_pt.clamp(0.0, 200.0)
+                        } else {
+                            0.0
+                        };
+                        (f.id, f.rect.expand(pad), f.wrap.mode)
+                    })
                     .collect()
             })
             .collect();
@@ -300,15 +320,31 @@ pub fn flow_story_into_chain(
     obstacles_per_page: &[Vec<(FrameId, Rect, WrapMode)>],
     pages: &mut [ComputedPageLayout],
 ) {
-    let line_height = (story.style.font_size_pt * story.style.line_height_factor).max(8.0);
+    let safe_font_size = if story.style.font_size_pt.is_finite() {
+        story.style.font_size_pt.clamp(4.0, 400.0)
+    } else {
+        12.0
+    };
+    let safe_lh_factor = if story.style.line_height_factor.is_finite() {
+        story.style.line_height_factor.clamp(0.8, 4.0)
+    } else {
+        1.35
+    };
+    let line_height = (safe_font_size * safe_lh_factor).max(8.0);
     let space_w = estimate_char_width_pt(
         ' ',
-        story.style.font_size_pt,
+        safe_font_size,
         &story.style.font_family,
         story.style.bold,
         story.style.italic,
     )
     .max(2.0);
+
+    let safe_style = TextStyle {
+        font_size_pt: safe_font_size,
+        line_height_factor: safe_lh_factor,
+        ..story.style.clone()
+    };
 
     // Tokenize paragraphs into words while preserving explicit line breaks
     let paragraphs: Vec<Vec<&str>> = story
@@ -321,7 +357,7 @@ pub fn flow_story_into_chain(
     let mut word_idx = 0;
 
     for (chain_pos, &(page_idx, frame_id, frame_rect)) in chain.iter().enumerate() {
-        let padding = doc
+        let raw_padding = doc
             .pages
             .get(page_idx)
             .and_then(|p| {
@@ -333,14 +369,39 @@ pub fn flow_story_into_chain(
                         _ => None,
                     })
             })
-            .unwrap_or(6.0)
-            .max(0.0);
+            .unwrap_or(6.0);
+        let padding = if raw_padding.is_finite() {
+            raw_padding.clamp(0.0, 200.0)
+        } else {
+            6.0
+        };
+
+        let fx = if frame_rect.x.is_finite() {
+            frame_rect.x.clamp(-10_000.0, 10_000.0)
+        } else {
+            0.0
+        };
+        let fy = if frame_rect.y.is_finite() {
+            frame_rect.y.clamp(-10_000.0, 10_000.0)
+        } else {
+            0.0
+        };
+        let fw = if frame_rect.width.is_finite() {
+            frame_rect.width.clamp(1.0, 10_000.0)
+        } else {
+            100.0
+        };
+        let fh = if frame_rect.height.is_finite() {
+            frame_rect.height.clamp(1.0, 10_000.0)
+        } else {
+            100.0
+        };
 
         let inner = Rect::new(
-            frame_rect.x + padding,
-            frame_rect.y + padding,
-            (frame_rect.width - padding * 2.0).max(12.0),
-            (frame_rect.height - padding * 2.0).max(12.0),
+            fx + padding,
+            fy + padding,
+            (fw - padding * 2.0).max(12.0),
+            (fh - padding * 2.0).max(12.0),
         );
 
         let page_obstacles = obstacles_per_page
@@ -350,8 +411,15 @@ pub fn flow_story_into_chain(
 
         let mut lines = Vec::new();
         let mut y = inner.y;
+        let mut band_iterations = 0usize;
 
-        while y + line_height <= inner.bottom() && para_idx < paragraphs.len() {
+        while y.is_finite()
+            && y + line_height <= inner.bottom()
+            && para_idx < paragraphs.len()
+            && lines.len() < MAX_LINES_PER_FRAME
+            && band_iterations < MAX_LINES_PER_FRAME * 2
+        {
+            band_iterations += 1;
             let band_rect = Rect::new(inner.x, y, inner.width, line_height);
             let segments = available_line_segments(frame_id, band_rect, page_obstacles);
 
@@ -362,6 +430,7 @@ pub fn flow_story_into_chain(
                     .filter(|&&(obs_id, obs_rect, mode)| {
                         obs_id != frame_id
                             && mode == WrapMode::JumpObject
+                            && obs_rect.bottom().is_finite()
                             && band_rect.intersects(&obs_rect)
                             && obs_rect.bottom() > y
                     })
@@ -369,15 +438,15 @@ pub fn flow_story_into_chain(
                     .fold(None::<f32>, |acc, b| Some(acc.map_or(b, |prev| prev.min(b))));
 
                 if let Some(next_y) = jump_bottom {
-                    y = next_y.max(y + 1.0);
+                    y = next_y.max(y + (line_height * 0.5).max(4.0));
                 } else {
-                    y += line_height * 0.5;
+                    y += (line_height * 0.5).max(4.0);
                 }
                 continue;
             }
 
             for (seg_x, seg_w) in segments {
-                if para_idx >= paragraphs.len() {
+                if para_idx >= paragraphs.len() || lines.len() >= MAX_LINES_PER_FRAME {
                     break;
                 }
                 let words = &paragraphs[para_idx];
@@ -394,7 +463,7 @@ pub fn flow_story_into_chain(
 
                 while word_idx < words.len() {
                     let word = words[word_idx];
-                    let word_w = measure_text_width_pt(word, &story.style);
+                    let word_w = measure_text_width_pt(word, &safe_style);
                     let candidate_w = if current_line.is_empty() {
                         word_w
                     } else {
@@ -418,7 +487,7 @@ pub fn flow_story_into_chain(
 
                 if !current_line.is_empty() {
                     let is_last_in_para = word_idx >= words.len();
-                    let effective_text_w = if story.style.alignment == TextAlignment::Justified
+                    let effective_text_w = if safe_style.alignment == TextAlignment::Justified
                         && !is_last_in_para
                         && words_on_line > 1
                     {
@@ -427,7 +496,7 @@ pub fn flow_story_into_chain(
                         current_width_pt.min(seg_w)
                     };
                     let align_offset = compute_alignment_offset_pt(
-                        story.style.alignment,
+                        safe_style.alignment,
                         seg_w,
                         effective_text_w,
                     );
@@ -438,12 +507,12 @@ pub fn flow_story_into_chain(
                         width_pt: seg_w,
                         height_pt: line_height,
                         text: current_line,
-                        font_family: story.style.font_family.clone(),
-                        font_size_pt: story.style.font_size_pt,
-                        bold: story.style.bold,
-                        italic: story.style.italic,
-                        color: story.style.color,
-                        alignment: story.style.alignment,
+                        font_family: safe_style.font_family.clone(),
+                        font_size_pt: safe_style.font_size_pt,
+                        bold: safe_style.bold,
+                        italic: safe_style.italic,
+                        color: safe_style.color,
+                        alignment: safe_style.alignment,
                     });
                 }
 
@@ -496,12 +565,25 @@ pub fn available_line_segments(
     band: Rect,
     obstacles: &[(FrameId, Rect, WrapMode)],
 ) -> Vec<(f32, f32)> {
-    if band.width <= 0.0 || band.height <= 0.0 {
+    if !band.x.is_finite()
+        || !band.y.is_finite()
+        || !band.width.is_finite()
+        || !band.height.is_finite()
+        || band.width <= 0.0
+        || band.height <= 0.0
+    {
         return Vec::new();
     }
     let mut intervals = vec![(band.x, band.right())];
     for &(obs_id, obs_rect, mode) in obstacles {
-        if mode == WrapMode::None || obs_id == text_frame_id || !band.intersects(&obs_rect) {
+        if mode == WrapMode::None
+            || obs_id == text_frame_id
+            || !obs_rect.x.is_finite()
+            || !obs_rect.y.is_finite()
+            || !obs_rect.width.is_finite()
+            || !obs_rect.height.is_finite()
+            || !band.intersects(&obs_rect)
+        {
             continue;
         }
         if mode == WrapMode::JumpObject {
@@ -528,7 +610,7 @@ pub fn available_line_segments(
         .into_iter()
         .filter_map(|(a, b)| {
             let w = b - a;
-            if w >= 36.0 {
+            if w.is_finite() && w >= 36.0 {
                 Some((a, w))
             } else {
                 None
@@ -1168,5 +1250,71 @@ mod tests {
             hit_test_text_cursor_index(tf, Point::new(300.0, 66.0)).expect("cursor hit line 2");
         assert_eq!(line2_idx, 1);
         assert_eq!(end_char_idx, "Second line here".chars().count());
+    }
+
+    #[test]
+    fn test_layout_resilience_against_nan_zero_font_sizes_and_extreme_obstacles() {
+        let mut doc = BookDocument::default();
+        let bad_style = TextStyle {
+            font_family: "Literata".to_string(),
+            font_size_pt: f32::NAN,
+            line_height_factor: 0.0,
+            bold: false,
+            italic: false,
+            color: ColorRgba::BLACK,
+            alignment: TextAlignment::Justified,
+        };
+        let story_id = doc.insert_story(Story::new(
+            "Adversarial Layout Story",
+            "Word ".repeat(5_000),
+            bad_style,
+        ));
+
+        let mut tf = Frame::new_text(Rect::new(f32::NAN, -50.0, 400.0, 50_000.0), story_id, 0);
+        if let book_core::FrameKind::Text {
+            ref mut padding_pt, ..
+        } = tf.kind
+        {
+            *padding_pt = f32::INFINITY;
+        }
+        let tf_id = tf.id;
+        doc.pages[0].frames.push(tf);
+
+        // Add overlapping BoundingBox and JumpObject obstacles, including one with NaN coords
+        let mut nan_obs = Frame::new_shape(
+            Rect::new(f32::NAN, 10.0, f32::INFINITY, 100.0),
+            ShapeKind::Rectangle,
+            ColorRgba::WARM_GOLD,
+        );
+        nan_obs.wrap = WrapSettings {
+            mode: WrapMode::BoundingBox,
+            padding_pt: f32::NAN,
+        };
+        doc.pages[0].frames.push(nan_obs);
+
+        let mut full_block_obs = Frame::new_shape(
+            Rect::new(-100.0, 0.0, 2_000.0, 200.0),
+            ShapeKind::Rectangle,
+            ColorRgba::ACCENT_BLUE,
+        );
+        full_block_obs.wrap = WrapSettings {
+            mode: WrapMode::JumpObject,
+            padding_pt: 20.0,
+        };
+        doc.pages[0].frames.push(full_block_obs);
+
+        let layout = ComputedBookLayout::compute(&doc);
+        let computed = &layout.pages[0].text_frames[&tf_id];
+        assert!(
+            computed.lines.len() <= MAX_LINES_PER_FRAME,
+            "Frame line count must be capped at MAX_LINES_PER_FRAME"
+        );
+        for line in &computed.lines {
+            assert!(line.x_pt.is_finite());
+            assert!(line.y_pt.is_finite());
+            assert!(line.width_pt.is_finite() && line.width_pt > 0.0);
+            assert!(line.height_pt.is_finite() && line.height_pt >= 8.0);
+            assert!(line.font_size_pt.is_finite() && line.font_size_pt >= 4.0);
+        }
     }
 }

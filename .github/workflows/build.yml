@@ -8,8 +8,6 @@ on:
 
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
 concurrency:
   group: "pages"
@@ -19,6 +17,10 @@ jobs:
   build-and-deploy-pages:
     name: Build WebAssembly & Deploy to GitHub Pages
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -55,7 +57,11 @@ jobs:
 
   build-macos-m1:
     name: Build macOS Apple Silicon (M1 Air) .app
-    runs-on: macos-14
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

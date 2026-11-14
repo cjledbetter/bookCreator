@@ -172,16 +172,59 @@ fn select_pdf_font_resource(font_family: &str, bold: bool, italic: bool) -> Name
     }
 }
 
+#[inline]
+fn clamp_pdf_coord(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(-10_000.0, 10_000.0)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn clamp_pdf_dim(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 10_000.0)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn clamp_pdf_font_size(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(4.0, 400.0)
+    } else {
+        12.0
+    }
+}
+
+#[inline]
+fn clamp_pdf_stroke_width(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(0.0, 200.0)
+    } else {
+        0.0
+    }
+}
+
 pub fn export_pdf_bytes(
     doc: &BookDocument,
     layout: &ComputedBookLayout,
     options: PdfExportOptions,
 ) -> Result<Vec<u8>, PdfExportError> {
-    if doc.setup.width_pt <= 0.0 || doc.setup.height_pt <= 0.0 {
+    if !doc.setup.width_pt.is_finite()
+        || !doc.setup.height_pt.is_finite()
+        || doc.setup.width_pt <= 0.0
+        || doc.setup.height_pt <= 0.0
+    {
         return Err(PdfExportError::Generation(
-            "Page width and height must be positive".to_string(),
+            "Page width and height must be finite and positive".to_string(),
         ));
     }
+
+    let page_w = doc.setup.width_pt.clamp(1.0, 5_000.0);
+    let page_h = doc.setup.height_pt.clamp(1.0, 5_000.0);
 
     let mut pdf = Pdf::new();
     let catalog_id = Ref::new(1);
@@ -191,15 +234,15 @@ pub fn export_pdf_bytes(
     pdf.catalog(catalog_id).pages(pages_id);
     let font_refs = StandardFontRefs::register(&mut pdf, &mut next_id);
 
-    let bleed = if options.include_bleed {
-        doc.setup.bleed_pt.max(0.0)
+    let bleed = if options.include_bleed && doc.setup.bleed_pt.is_finite() {
+        doc.setup.bleed_pt.clamp(0.0, 72.0)
     } else {
         0.0
     };
     let crop_margin = if options.include_crop_marks { 18.0 } else { 0.0 };
     let total_offset = bleed + crop_margin;
-    let media_w = doc.setup.width_pt + total_offset * 2.0;
-    let media_h = doc.setup.height_pt + total_offset * 2.0;
+    let media_w = page_w + total_offset * 2.0;
+    let media_h = page_h + total_offset * 2.0;
 
     let mut page_ids = Vec::with_capacity(doc.pages.len());
 
@@ -226,8 +269,8 @@ pub fn export_pdf_bytes(
         content.rect(
             crop_margin,
             crop_margin,
-            doc.setup.width_pt + bleed * 2.0,
-            doc.setup.height_pt + bleed * 2.0,
+            page_w + bleed * 2.0,
+            page_h + bleed * 2.0,
         );
         content.fill_nonzero();
         content.restore_state();
@@ -237,8 +280,8 @@ pub fn export_pdf_bytes(
             draw_crop_and_registration_marks(
                 &mut content,
                 total_offset,
-                doc.setup.width_pt,
-                doc.setup.height_pt,
+                page_w,
+                page_h,
                 bleed,
             );
         }
@@ -273,14 +316,14 @@ pub fn export_pdf_bytes(
         page_writer.bleed_box(PdfRect::new(
             crop_margin,
             crop_margin,
-            crop_margin + doc.setup.width_pt + bleed * 2.0,
-            crop_margin + doc.setup.height_pt + bleed * 2.0,
+            crop_margin + page_w + bleed * 2.0,
+            crop_margin + page_h + bleed * 2.0,
         ));
         page_writer.trim_box(PdfRect::new(
             total_offset,
             total_offset,
-            total_offset + doc.setup.width_pt,
-            total_offset + doc.setup.height_pt,
+            total_offset + page_w,
+            total_offset + page_h,
         ));
         page_writer.contents(content_id);
 
@@ -430,10 +473,13 @@ fn render_frame(
     frame: &Frame,
     total_offset: f32,
 ) {
-    let pdf_x = total_offset + frame.rect.x;
-    let pdf_y = total_offset + (doc.setup.height_pt - frame.rect.y - frame.rect.height);
-    let w = frame.rect.width.max(0.0);
-    let h = frame.rect.height.max(0.0);
+    let fx = clamp_pdf_coord(frame.rect.x);
+    let fy = clamp_pdf_coord(frame.rect.y);
+    let w = clamp_pdf_dim(frame.rect.width);
+    let h = clamp_pdf_dim(frame.rect.height);
+    let page_h = doc.setup.height_pt.clamp(1.0, 5_000.0);
+    let pdf_x = clamp_pdf_coord(total_offset + fx);
+    let pdf_y = clamp_pdf_coord(total_offset + (page_h - fy - h));
 
     match &frame.kind {
         FrameKind::Shape {
@@ -452,8 +498,8 @@ fn render_frame(
                 h,
                 *fill,
                 *stroke_color,
-                *stroke_width_pt,
-                *corner_radius_pt,
+                clamp_pdf_stroke_width(*stroke_width_pt),
+                clamp_pdf_dim(*corner_radius_pt),
             );
         }
         FrameKind::Image {
@@ -472,7 +518,7 @@ fn render_frame(
                 asset_id.as_deref(),
                 *fit,
                 caption,
-                *corner_radius_pt,
+                clamp_pdf_dim(*corner_radius_pt),
             );
         }
         FrameKind::Text {
@@ -489,7 +535,7 @@ fn render_frame(
                 pdf_y,
                 w,
                 h,
-                *padding_pt,
+                clamp_pdf_dim(*padding_pt),
                 *background,
                 total_offset,
             );
@@ -777,38 +823,44 @@ fn render_positioned_text_line(
     total_offset: f32,
     is_last_line: bool,
 ) {
-    let est_w = estimate_text_width(&line.text, line.font_size_pt, line.bold);
-    let slack = (line.width_pt - est_w).max(0.0);
+    let safe_font_size = clamp_pdf_font_size(line.font_size_pt);
+    let safe_line_x = clamp_pdf_coord(line.x_pt);
+    let safe_line_y = clamp_pdf_coord(line.y_pt);
+    let safe_line_w = clamp_pdf_dim(line.width_pt);
+    let safe_inner_left = clamp_pdf_coord(frame_inner_left);
+
+    let est_w = estimate_text_width(&line.text, safe_font_size, line.bold);
+    let slack = (safe_line_w - est_w).max(0.0);
 
     // Check if the layout engine already shifted `line.x_pt` for alignment, or if `line.x_pt`
     // is at the left edge of the line segment.
-    let already_shifted = (line.x_pt - frame_inner_left).abs() > 1.5;
+    let already_shifted = (safe_line_x - safe_inner_left).abs() > 1.5;
 
     let aligned_x = match line.alignment {
-        TextAlignment::Left | TextAlignment::Justified => line.x_pt,
+        TextAlignment::Left | TextAlignment::Justified => safe_line_x,
         TextAlignment::Center => {
             if already_shifted {
-                line.x_pt
+                safe_line_x
             } else {
-                line.x_pt + slack * 0.5
+                safe_line_x + slack * 0.5
             }
         }
         TextAlignment::Right => {
             if already_shifted {
-                line.x_pt
+                safe_line_x
             } else {
-                line.x_pt + slack
+                safe_line_x + slack
             }
         }
     };
 
-    let line_pdf_x = total_offset + aligned_x;
-    let line_pdf_y = total_offset + (page_height_pt - line.y_pt - line.font_size_pt);
+    let line_pdf_x = clamp_pdf_coord(total_offset + aligned_x);
+    let line_pdf_y = clamp_pdf_coord(total_offset + (page_height_pt - safe_line_y - safe_font_size));
     let font_res = select_pdf_font_resource(&line.font_family, line.bold, line.italic);
 
     content.save_state();
     content.begin_text();
-    content.set_font(font_res, line.font_size_pt);
+    content.set_font(font_res, safe_font_size);
     content.set_fill_rgb(
         line.color.r as f32 / 255.0,
         line.color.g as f32 / 255.0,
@@ -817,7 +869,7 @@ fn render_positioned_text_line(
 
     if line.alignment == TextAlignment::Justified && !is_last_line {
         let space_count = line.text.chars().filter(|&c| c == ' ').count();
-        if space_count > 0 && slack > 0.0 && slack < line.width_pt * 0.35 {
+        if space_count > 0 && slack > 0.0 && slack < safe_line_w * 0.35 {
             content.set_word_spacing(slack / space_count as f32);
         }
     }
@@ -1126,5 +1178,68 @@ mod tests {
         let disk_bytes = std::fs::read(&tmp_path).expect("PDF file should exist on disk");
         let _ = std::fs::remove_file(&tmp_path);
         assert!(disk_bytes.starts_with(b"%PDF-1."));
+    }
+
+    #[test]
+    fn pdf_export_clamps_non_finite_geometry_and_neutralizes_control_chars() {
+        let mut bad_doc = BookDocument::default();
+        bad_doc.setup.width_pt = f32::NAN;
+        let empty_layout = ComputedBookLayout::default();
+        assert!(
+            export_pdf_bytes(&bad_doc, &empty_layout, PdfExportOptions::default()).is_err(),
+            "PDF exporter must reject non-finite page dimensions"
+        );
+
+        let mut doc = BookDocument::default();
+        doc.setup.bleed_pt = f32::INFINITY;
+        let story = Story::new(
+            "Control Char Story",
+            "Hello\x00\x07PDF((World))\\Test",
+            TextStyle {
+                font_family: "Literata".to_string(),
+                font_size_pt: f32::NAN,
+                line_height_factor: f32::INFINITY,
+                bold: false,
+                italic: false,
+                color: ColorRgba::BLACK,
+                alignment: TextAlignment::Left,
+            },
+        );
+        let sid = doc.insert_story(story);
+        doc.pages[0]
+            .frames
+            .push(Frame::new_text(Rect::new(f32::NAN, f32::INFINITY, -50.0, 200.0), sid, 0));
+
+        let mut shape = Frame::new_shape(
+            Rect::new(f32::NEG_INFINITY, 20.0, f32::NAN, 80.0),
+            ShapeKind::RoundedRectangle,
+            ColorRgba::ACCENT_BLUE,
+        );
+        if let FrameKind::Shape {
+            ref mut stroke_width_pt,
+            ref mut corner_radius_pt,
+            ..
+        } = shape.kind
+        {
+            *stroke_width_pt = f32::INFINITY;
+            *corner_radius_pt = f32::NAN;
+        }
+        doc.pages[0].frames.push(shape);
+
+        let layout = ComputedBookLayout::compute(&doc);
+        let bytes = export_pdf_bytes(
+            &doc,
+            &layout,
+            PdfExportOptions {
+                include_bleed: true,
+                include_crop_marks: true,
+            },
+        )
+        .expect("PDF export with clamped non-finite frame values should succeed");
+
+        let pdf_str = String::from_utf8_lossy(&bytes);
+        assert!(!pdf_str.contains("NaN"), "PDF stream must never contain NaN");
+        assert!(!pdf_str.contains("inf"), "PDF stream must never contain inf");
+        assert!(!bytes.contains(&0x07), "Control char 0x07 must be stripped/replaced");
     }
 }

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -16,6 +16,107 @@ pub type MasterPageId = Uuid;
 pub type FrameId = Uuid;
 pub type StoryId = Uuid;
 pub type AssetId = String;
+
+/// Maximum number of entries permitted inside a `.book` ZIP archive.
+pub const MAX_ARCHIVE_ENTRIES: usize = 1_024;
+/// Maximum uncompressed size of `document.json` (16 MiB).
+pub const MAX_DOC_JSON_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum uncompressed size of a single embedded image or font asset (64 MiB).
+pub const MAX_SINGLE_ASSET_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum total uncompressed size of a `.book` bundle across all entries (256 MiB).
+pub const MAX_TOTAL_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
+
+#[inline]
+fn sanitize_finite_f32(val: f32, default: f32, min: f32, max: f32) -> f32 {
+    if val.is_nan() {
+        default.clamp(min, max)
+    } else {
+        val.clamp(min, max)
+    }
+}
+
+/// Strips directory components from `name`, restricts characters to safe ASCII
+/// `[A-Za-z0-9._-]`, and falls back to `"asset.bin"` if empty or unsafe.
+pub fn sanitize_asset_filename(name: &str) -> String {
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    let cleaned: String = base
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .collect();
+    let trimmed = cleaned.trim_start_matches('.');
+    if trimmed.is_empty() || !trimmed.chars().any(|c| c.is_ascii_alphanumeric()) {
+        "asset.bin".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Validates that `path` is a safe relative bundle path inside `assets/images/` or
+/// `assets/fonts/` with no path traversal (`..`), absolute roots, drive prefixes,
+/// backslashes, null bytes, or unsafe characters.
+pub fn validate_safe_relative_bundle_path(path: &str) -> Result<PathBuf, BookError> {
+    if path.is_empty() {
+        return Err(BookError::InvalidBundle(
+            "Asset relative_path must not be empty".into(),
+        ));
+    }
+    if path.contains('\0') {
+        return Err(BookError::InvalidBundle(
+            "Asset relative_path contains null byte".into(),
+        ));
+    }
+    if path.starts_with('/') || path.starts_with('\\') || path.contains('\\') || path.contains(':')
+    {
+        return Err(BookError::InvalidBundle(format!(
+            "Asset relative_path must be a portable relative path without OS prefixes: {path}"
+        )));
+    }
+    if !path.starts_with("assets/images/") && !path.starts_with("assets/fonts/") {
+        return Err(BookError::InvalidBundle(format!(
+            "Asset relative_path must reside under assets/images/ or assets/fonts/: {path}"
+        )));
+    }
+
+    let raw_segments: Vec<&str> = path.split('/').collect();
+    if raw_segments.len() != 3 {
+        return Err(BookError::InvalidBundle(format!(
+            "Asset relative_path must be a direct child of assets/images/ or assets/fonts/: {path}"
+        )));
+    }
+    let leaf = raw_segments[2];
+    if leaf.is_empty()
+        || leaf.starts_with('.')
+        || leaf.contains("..")
+        || !leaf
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(BookError::InvalidBundle(format!(
+            "Asset relative_path contains unsafe filename characters: {path}"
+        )));
+    }
+
+    let candidate = Path::new(path);
+    for comp in candidate.components() {
+        match comp {
+            Component::Normal(_) => {}
+            Component::ParentDir
+            | Component::CurDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(BookError::InvalidBundle(format!(
+                    "Path traversal or non-normal path component rejected: {path}"
+                )));
+            }
+        }
+    }
+
+    Ok(candidate.to_path_buf())
+}
 
 #[derive(Debug, Error)]
 pub enum BookError {
@@ -87,12 +188,20 @@ impl Rect {
     }
 
     pub fn expand(&self, padding: f32) -> Rect {
+        let p = if padding.is_finite() { padding } else { 0.0 };
         Rect::new(
-            self.x - padding,
-            self.y - padding,
-            (self.width + padding * 2.0).max(0.0),
-            (self.height + padding * 2.0).max(0.0),
+            self.x - p,
+            self.y - p,
+            (self.width + p * 2.0).max(0.0),
+            (self.height + p * 2.0).max(0.0),
         )
+    }
+
+    pub fn sanitize(&mut self) {
+        self.x = sanitize_finite_f32(self.x, 0.0, -10_000.0, 10_000.0);
+        self.y = sanitize_finite_f32(self.y, 0.0, -10_000.0, 10_000.0);
+        self.width = sanitize_finite_f32(self.width, 100.0, 1.0, 10_000.0);
+        self.height = sanitize_finite_f32(self.height, 100.0, 1.0, 10_000.0);
     }
 }
 
@@ -238,6 +347,16 @@ impl PageSetup {
             (self.height_pt - self.margins.top - self.margins.bottom).max(10.0),
         )
     }
+
+    pub fn sanitize(&mut self) {
+        self.width_pt = sanitize_finite_f32(self.width_pt, 432.0, 72.0, 5_000.0);
+        self.height_pt = sanitize_finite_f32(self.height_pt, 648.0, 72.0, 5_000.0);
+        self.bleed_pt = sanitize_finite_f32(self.bleed_pt, 9.0, 0.0, 72.0);
+        self.margins.top = sanitize_finite_f32(self.margins.top, 36.0, 0.0, 500.0);
+        self.margins.bottom = sanitize_finite_f32(self.margins.bottom, 36.0, 0.0, 500.0);
+        self.margins.inside = sanitize_finite_f32(self.margins.inside, 45.0, 0.0, 500.0);
+        self.margins.outside = sanitize_finite_f32(self.margins.outside, 36.0, 0.0, 500.0);
+    }
 }
 
 impl Default for PageSetup {
@@ -328,6 +447,12 @@ impl Default for WrapSettings {
     }
 }
 
+impl WrapSettings {
+    pub fn sanitize(&mut self) {
+        self.padding_pt = sanitize_finite_f32(self.padding_pt, 8.0, 0.0, 200.0);
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextAlignment {
     Left,
@@ -363,6 +488,16 @@ impl Default for TextStyle {
             italic: false,
             color: ColorRgba::BLACK,
             alignment: TextAlignment::Left,
+        }
+    }
+}
+
+impl TextStyle {
+    pub fn sanitize(&mut self) {
+        self.font_size_pt = sanitize_finite_f32(self.font_size_pt, 12.0, 4.0, 400.0);
+        self.line_height_factor = sanitize_finite_f32(self.line_height_factor, 1.35, 0.8, 4.0);
+        if self.font_family.trim().is_empty() {
+            self.font_family = "Literata".to_string();
         }
     }
 }
@@ -504,6 +639,30 @@ impl Frame {
                 stroke_width_pt: 1.0,
                 corner_radius_pt: 8.0,
             },
+        }
+    }
+
+    pub fn sanitize(&mut self) {
+        self.rect.sanitize();
+        self.rotation_deg = sanitize_finite_f32(self.rotation_deg, 0.0, -360.0, 360.0);
+        self.wrap.sanitize();
+        match &mut self.kind {
+            FrameKind::Text { padding_pt, .. } => {
+                *padding_pt = sanitize_finite_f32(*padding_pt, 6.0, 0.0, 200.0);
+            }
+            FrameKind::Image {
+                corner_radius_pt, ..
+            } => {
+                *corner_radius_pt = sanitize_finite_f32(*corner_radius_pt, 0.0, 0.0, 1_000.0);
+            }
+            FrameKind::Shape {
+                stroke_width_pt,
+                corner_radius_pt,
+                ..
+            } => {
+                *stroke_width_pt = sanitize_finite_f32(*stroke_width_pt, 1.0, 0.0, 200.0);
+                *corner_radius_pt = sanitize_finite_f32(*corner_radius_pt, 0.0, 0.0, 1_000.0);
+            }
         }
     }
 }
@@ -708,6 +867,25 @@ impl BookDocument {
         false
     }
 
+    /// Clamp non-finite (`NaN`, `Infinity`) or out-of-range numeric values across
+    /// `PageSetup`, `Rect`, `TextStyle`, `WrapSettings`, and `Frame` properties.
+    pub fn sanitize(&mut self) {
+        self.setup.sanitize();
+        for master in &mut self.master_pages {
+            for frame in &mut master.frames {
+                frame.sanitize();
+            }
+        }
+        for page in &mut self.pages {
+            for frame in &mut page.frames {
+                frame.sanitize();
+            }
+        }
+        for story in self.stories.values_mut() {
+            story.style.sanitize();
+        }
+    }
+
     /// Register an image or font asset in the portable bundle using relative paths only.
     pub fn add_asset_bytes(
         &mut self,
@@ -719,16 +897,13 @@ impl BookDocument {
         pixel_dimensions: Option<(u32, u32)>,
     ) -> AssetId {
         let id = id.into();
-        let filename_str = Path::new(&filename.into())
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("asset.bin")
-            .to_string();
+        let safe_id_part = sanitize_asset_filename(&id);
+        let filename_str = sanitize_asset_filename(&filename.into());
         let subdir = match kind {
             AssetKind::Image => "assets/images",
             AssetKind::Font => "assets/fonts",
         };
-        let relative_path = format!("{subdir}/{id}_{filename_str}");
+        let relative_path = format!("{subdir}/{safe_id_part}_{filename_str}");
         self.assets.insert(
             id.clone(),
             AssetEntry {
@@ -762,8 +937,10 @@ impl BookDocument {
             zip.write_all(&doc_json)?;
 
             for (asset_id, entry) in &self.assets {
+                let safe_rel = validate_safe_relative_bundle_path(&entry.relative_path)?;
                 if let Some(bytes) = self.asset_bytes.get(asset_id) {
-                    zip.start_file(&entry.relative_path, options)?;
+                    let rel_str = safe_rel.to_string_lossy().replace('\\', "/");
+                    zip.start_file(rel_str, options)?;
                     zip.write_all(bytes)?;
                 }
             }
@@ -779,14 +956,50 @@ impl BookDocument {
         let cursor = std::io::Cursor::new(bytes);
         let mut archive = zip::ZipArchive::new(cursor)?;
 
-        let mut doc_bytes = Vec::new();
-        {
-            let mut doc_file = archive
-                .by_name("document.json")
-                .map_err(|_| BookError::InvalidBundle("Missing document.json".into()))?;
-            doc_file.read_to_end(&mut doc_bytes)?;
+        if archive.len() > MAX_ARCHIVE_ENTRIES {
+            return Err(BookError::InvalidBundle(format!(
+                "ZIP archive exceeds maximum entry count ({} > {})",
+                archive.len(),
+                MAX_ARCHIVE_ENTRIES
+            )));
         }
 
+        // Inspect all archive entry names upfront to reject Zip-Slip / path traversal entries
+        for i in 0..archive.len() {
+            let entry = archive.by_index_raw(i)?;
+            let name = entry.name();
+            if name != "manifest.json" && name != "document.json" {
+                let trimmed = name.trim_end_matches('/');
+                if trimmed != "assets" && trimmed != "assets/images" && trimmed != "assets/fonts" {
+                    validate_safe_relative_bundle_path(name)?;
+                }
+            }
+        }
+
+        let mut doc_bytes = Vec::new();
+        {
+            let doc_file = archive
+                .by_name("document.json")
+                .map_err(|_| BookError::InvalidBundle("Missing document.json".into()))?;
+            if doc_file.size() > MAX_DOC_JSON_BYTES {
+                return Err(BookError::InvalidBundle(format!(
+                    "document.json exceeds maximum size ({} > {} bytes)",
+                    doc_file.size(),
+                    MAX_DOC_JSON_BYTES
+                )));
+            }
+            doc_file
+                .take(MAX_DOC_JSON_BYTES + 1)
+                .read_to_end(&mut doc_bytes)?;
+            if doc_bytes.len() as u64 > MAX_DOC_JSON_BYTES {
+                return Err(BookError::InvalidBundle(format!(
+                    "document.json decompressed stream exceeds {} bytes",
+                    MAX_DOC_JSON_BYTES
+                )));
+            }
+        }
+
+        let mut total_uncompressed_bytes = doc_bytes.len() as u64;
         let mut doc: BookDocument = serde_json::from_slice(&doc_bytes)?;
         let asset_entries: Vec<(AssetId, String)> = doc
             .assets
@@ -795,13 +1008,40 @@ impl BookDocument {
             .collect();
 
         for (asset_id, rel_path) in asset_entries {
-            if let Ok(mut asset_file) = archive.by_name(&rel_path) {
+            let safe_rel = validate_safe_relative_bundle_path(&rel_path)?;
+            let safe_rel_str = safe_rel.to_string_lossy().replace('\\', "/");
+            if let Ok(asset_file) = archive.by_name(&safe_rel_str) {
+                if asset_file.size() > MAX_SINGLE_ASSET_BYTES {
+                    return Err(BookError::InvalidBundle(format!(
+                        "Asset '{}' exceeds maximum size ({} > {} bytes)",
+                        safe_rel_str,
+                        asset_file.size(),
+                        MAX_SINGLE_ASSET_BYTES
+                    )));
+                }
                 let mut buf = Vec::new();
-                asset_file.read_to_end(&mut buf)?;
+                asset_file
+                    .take(MAX_SINGLE_ASSET_BYTES + 1)
+                    .read_to_end(&mut buf)?;
+                if buf.len() as u64 > MAX_SINGLE_ASSET_BYTES {
+                    return Err(BookError::InvalidBundle(format!(
+                        "Asset '{}' decompressed stream exceeds {} bytes",
+                        safe_rel_str, MAX_SINGLE_ASSET_BYTES
+                    )));
+                }
+                total_uncompressed_bytes =
+                    total_uncompressed_bytes.saturating_add(buf.len() as u64);
+                if total_uncompressed_bytes > MAX_TOTAL_BUNDLE_BYTES {
+                    return Err(BookError::InvalidBundle(format!(
+                        "Total uncompressed bundle size exceeds {} bytes",
+                        MAX_TOTAL_BUNDLE_BYTES
+                    )));
+                }
                 doc.asset_bytes.insert(asset_id, buf);
             }
         }
 
+        doc.sanitize();
         Ok(doc)
     }
 
@@ -815,9 +1055,16 @@ impl BookDocument {
 
     /// Load a single-file portable `.book` ZIP archive.
     pub fn load_book_archive(path: impl AsRef<Path>) -> Result<Self, BookError> {
-        let mut file = File::open(path)?;
+        let file = File::open(path)?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        file.take(MAX_TOTAL_BUNDLE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_TOTAL_BUNDLE_BYTES {
+            return Err(BookError::InvalidBundle(format!(
+                "Archive file exceeds {} bytes",
+                MAX_TOTAL_BUNDLE_BYTES
+            )));
+        }
         Self::from_book_archive_bytes(&bytes)
     }
 
@@ -834,8 +1081,9 @@ impl BookDocument {
         fs::write(dir.join("document.json"), serde_json::to_vec_pretty(self)?)?;
 
         for (asset_id, entry) in &self.assets {
+            let safe_rel = validate_safe_relative_bundle_path(&entry.relative_path)?;
             if let Some(bytes) = self.asset_bytes.get(asset_id) {
-                let target: PathBuf = dir.join(&entry.relative_path);
+                let target: PathBuf = dir.join(safe_rel);
                 if let Some(parent) = target.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -848,16 +1096,55 @@ impl BookDocument {
     /// Load from an unpacked `.bookdir` directory.
     pub fn load_book_directory(dir: impl AsRef<Path>) -> Result<Self, BookError> {
         let dir = dir.as_ref();
-        let doc_bytes = fs::read(dir.join("document.json"))?;
+        let doc_path = dir.join("document.json");
+        let mut doc_bytes = Vec::new();
+        File::open(&doc_path)?
+            .take(MAX_DOC_JSON_BYTES + 1)
+            .read_to_end(&mut doc_bytes)?;
+        if doc_bytes.len() as u64 > MAX_DOC_JSON_BYTES {
+            return Err(BookError::InvalidBundle(format!(
+                "document.json exceeds maximum size ({} bytes)",
+                MAX_DOC_JSON_BYTES
+            )));
+        }
+
+        let mut total_uncompressed_bytes = doc_bytes.len() as u64;
         let mut doc: BookDocument = serde_json::from_slice(&doc_bytes)?;
 
         for (asset_id, entry) in &doc.assets {
-            let asset_path = dir.join(&entry.relative_path);
+            let safe_rel = validate_safe_relative_bundle_path(&entry.relative_path)?;
+            let asset_path = dir.join(&safe_rel);
             if asset_path.exists() {
-                doc.asset_bytes
-                    .insert(asset_id.clone(), fs::read(asset_path)?);
+                let sym_meta = fs::symlink_metadata(&asset_path)?;
+                if sym_meta.file_type().is_symlink() {
+                    return Err(BookError::InvalidBundle(format!(
+                        "Symlink assets are not permitted inside .bookdir: {}",
+                        entry.relative_path
+                    )));
+                }
+                let mut buf = Vec::new();
+                File::open(&asset_path)?
+                    .take(MAX_SINGLE_ASSET_BYTES + 1)
+                    .read_to_end(&mut buf)?;
+                if buf.len() as u64 > MAX_SINGLE_ASSET_BYTES {
+                    return Err(BookError::InvalidBundle(format!(
+                        "Asset '{}' exceeds maximum size ({} bytes)",
+                        entry.relative_path, MAX_SINGLE_ASSET_BYTES
+                    )));
+                }
+                total_uncompressed_bytes =
+                    total_uncompressed_bytes.saturating_add(buf.len() as u64);
+                if total_uncompressed_bytes > MAX_TOTAL_BUNDLE_BYTES {
+                    return Err(BookError::InvalidBundle(format!(
+                        "Total uncompressed bundle size exceeds {} bytes",
+                        MAX_TOTAL_BUNDLE_BYTES
+                    )));
+                }
+                doc.asset_bytes.insert(asset_id.clone(), buf);
             }
         }
+
+        doc.sanitize();
         Ok(doc)
     }
 
@@ -1736,5 +2023,124 @@ mod tests {
             .frames
             .iter()
             .any(|f| f.label.contains("Spine")));
+    }
+
+    #[test]
+    fn rejects_zip_slip_and_path_traversal_attacks() {
+        let malicious_paths = [
+            "",
+            "../../etc/passwd",
+            "/etc/shadow",
+            "assets/images/../../evil.sh",
+            "assets/fonts/../../../root/.ssh/authorized_keys",
+            "C:\\Windows\\System32\\cmd.exe",
+            "\\Windows\\System32\\drivers\\etc\\hosts",
+            "assets/images/evil\0.png",
+            "assets/images/sub/nested.png",
+            "assets/images/.hidden",
+            "assets/images/\"onload=\"alert(1).png",
+        ];
+
+        for bad in malicious_paths {
+            assert!(
+                validate_safe_relative_bundle_path(bad).is_err(),
+                "Expected path '{bad}' to be rejected by validate_safe_relative_bundle_path"
+            );
+        }
+
+        assert!(validate_safe_relative_bundle_path("assets/images/cover_01.png").is_ok());
+        assert!(validate_safe_relative_bundle_path("assets/fonts/Literata-Regular.ttf").is_ok());
+
+        assert_eq!(sanitize_asset_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_asset_filename("/etc/shadow"), "shadow");
+        assert_eq!(sanitize_asset_filename("..."), "asset.bin");
+        assert_eq!(sanitize_asset_filename(""), "asset.bin");
+
+        // Verify save_book_directory and to_book_archive_bytes reject tampered relative_path
+        let mut tampered_doc = BookDocument::default();
+        tampered_doc.assets.insert(
+            "evil".to_string(),
+            AssetEntry {
+                id: "evil".to_string(),
+                kind: AssetKind::Image,
+                relative_path: "assets/images/../../evil.sh".to_string(),
+                original_filename: "evil.sh".to_string(),
+                mime_type: "application/x-sh".to_string(),
+                pixel_dimensions: None,
+            },
+        );
+        tampered_doc
+            .asset_bytes
+            .insert("evil".to_string(), b"#!/bin/sh\n".to_vec());
+
+        assert!(tampered_doc.to_book_archive_bytes().is_err());
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(tampered_doc.save_book_directory(tmp.path()).is_err());
+
+        // Craft a malicious ZIP in memory containing a Zip-Slip entry (`../../etc/passwd`)
+        let mut zip_buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut zip_buf);
+            let opts = zip::write::SimpleFileOptions::default();
+            let doc_json = serde_json::to_vec(&tampered_doc).unwrap();
+            zip.start_file("document.json", opts).unwrap();
+            zip.write_all(&doc_json).unwrap();
+            zip.start_file("../../etc/passwd", opts).unwrap();
+            zip.write_all(b"root:x:0:0").unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(
+            BookDocument::from_book_archive_bytes(&zip_buf.into_inner()).is_err(),
+            "from_book_archive_bytes must reject ZIP archives containing path traversal entries"
+        );
+    }
+
+    #[test]
+    fn sanitize_clamps_nan_infinity_negative_dimensions_and_zero_font_sizes() {
+        let mut doc = BookDocument::default();
+        doc.setup.width_pt = f32::NAN;
+        doc.setup.height_pt = f32::INFINITY;
+        doc.setup.bleed_pt = -50.0;
+
+        let bad_style = TextStyle {
+            font_family: String::new(),
+            font_size_pt: 0.0,
+            line_height_factor: f32::NAN,
+            bold: false,
+            italic: false,
+            color: ColorRgba::BLACK,
+            alignment: TextAlignment::Left,
+        };
+        let story_id = doc.insert_story(Story::new("Bad Story", "Test text", bad_style));
+
+        let mut bad_frame = Frame::new_text(
+            Rect::new(f32::NEG_INFINITY, f32::NAN, -250.0, 0.0),
+            story_id,
+            0,
+        );
+        bad_frame.rotation_deg = f32::INFINITY;
+        bad_frame.wrap.padding_pt = -10.0;
+        doc.pages[0].frames.push(bad_frame);
+
+        doc.sanitize();
+
+        assert!(doc.setup.width_pt.is_finite() && (72.0..=5000.0).contains(&doc.setup.width_pt));
+        assert_eq!(doc.setup.height_pt, 5000.0);
+        assert_eq!(doc.setup.bleed_pt, 0.0);
+
+        let sanitized_story = doc.stories.get(&story_id).unwrap();
+        assert_eq!(sanitized_story.style.font_size_pt, 4.0);
+        assert!(
+            sanitized_story.style.line_height_factor.is_finite()
+                && (0.8..=4.0).contains(&sanitized_story.style.line_height_factor)
+        );
+        assert_eq!(sanitized_story.style.font_family, "Literata");
+
+        let sanitized_frame = &doc.pages[0].frames[0];
+        assert_eq!(sanitized_frame.rect.x, -10_000.0);
+        assert_eq!(sanitized_frame.rect.y, 0.0);
+        assert_eq!(sanitized_frame.rect.width, 1.0);
+        assert_eq!(sanitized_frame.rect.height, 1.0);
+        assert_eq!(sanitized_frame.wrap.padding_pt, 0.0);
     }
 }

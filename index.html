@@ -3,6 +3,8 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' blob:; object-src 'none'; base-uri 'self';" />
+    <meta name="referrer" content="no-referrer" />
     <title>Book Creator — Visual Print PDF &amp; EPUB 3 Studio</title>
     <link data-trunk rel="rust" href="crates/book-app/Cargo.toml" data-cargo-crate="book-app" data-bin="book-creator" data-wasm-opt="z" />
     <style>

@@ -80,7 +80,10 @@ pub fn export_epub_bytes(
 
         // 4. Write embedded image & font assets into `OEBPS/assets/...` and declare in `<manifest>`
         for (asset_idx, (asset_id, entry)) in doc.assets.iter().enumerate() {
-            let rel_path = normalize_portable_rel_path(&entry.relative_path);
+            let Ok(safe_rel_buf) = book_core::validate_safe_relative_bundle_path(&entry.relative_path) else {
+                continue;
+            };
+            let rel_path = normalize_portable_rel_path(&safe_rel_buf.to_string_lossy());
             let manifest_id = format!("asset_{}_{}", asset_idx + 1, sanitize_xml_id(asset_id));
             let media_type = if entry.mime_type.trim().is_empty() {
                 infer_mime_type(&rel_path)
@@ -321,14 +324,19 @@ hr.divider {
     // Emit `@font-face` declarations for any embedded font assets
     for entry in doc.assets.values() {
         if entry.kind == AssetKind::Font {
-            let rel_path = normalize_portable_rel_path(&entry.relative_path);
+            let Ok(safe_rel_buf) =
+                book_core::validate_safe_relative_bundle_path(&entry.relative_path)
+            else {
+                continue;
+            };
+            let rel_path = normalize_portable_rel_path(&safe_rel_buf.to_string_lossy());
             let family_name = Path::new(&entry.original_filename)
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or(&entry.id);
             css.push_str(&format!(
                 "\n@font-face {{\n  font-family: \"{}\";\n  src: url(\"{}\");\n}}\n",
-                escape_css_string(family_name),
+                sanitize_css_identifier(family_name),
                 escape_css_string(&rel_path)
             ));
         }
@@ -584,10 +592,15 @@ fn render_fixed_image(
         ImageFit::Stretch => "fill",
     };
 
-    let resolved_entry: Option<&AssetEntry> = asset_id.and_then(|id| doc.assets.get(id));
+    let resolved_entry: Option<(&AssetEntry, String)> = asset_id
+        .and_then(|id| doc.assets.get(id))
+        .and_then(|entry| {
+            book_core::validate_safe_relative_bundle_path(&entry.relative_path)
+                .ok()
+                .map(|p| (entry, normalize_portable_rel_path(&p.to_string_lossy())))
+        });
 
-    if let Some(entry) = resolved_entry {
-        let rel_path = normalize_portable_rel_path(&entry.relative_path);
+    if let Some((entry, rel_path)) = resolved_entry {
         let alt_text = if caption.trim().is_empty() {
             &entry.original_filename
         } else {
@@ -631,13 +644,14 @@ fn render_fixed_text_line(body: &mut String, line: &PositionedTextLine, is_last:
             }
         }
     };
+    let safe_font = sanitize_css_identifier(&line.font_family);
 
     body.push_str(&format!(
         "  <div class=\"fixed-text-line\" style=\"position:absolute;left:{:.1}px;top:{:.1}px;width:{:.1}px;font-family:'{}',serif;font-size:{:.1}px;font-weight:{weight};font-style:{style};color:rgb({},{},{});{align_css}white-space:pre;\">{}</div>\n",
         line.x_pt,
         line.y_pt,
         line.width_pt,
-        escape_xml(&line.font_family),
+        escape_xml(&safe_font),
         line.font_size_pt,
         line.color.r,
         line.color.g,
@@ -689,11 +703,17 @@ fn render_reflowable_page_xhtml(
             FrameKind::Image {
                 asset_id, caption, ..
             } => {
-                let resolved_entry = asset_id.as_deref().and_then(|id| doc.assets.get(id));
+                let resolved_entry = asset_id
+                    .as_deref()
+                    .and_then(|id| doc.assets.get(id))
+                    .and_then(|entry| {
+                        book_core::validate_safe_relative_bundle_path(&entry.relative_path)
+                            .ok()
+                            .map(|p| (entry, normalize_portable_rel_path(&p.to_string_lossy())))
+                    });
                 if resolved_entry.is_some() || !caption.trim().is_empty() {
                     content_html.push_str("    <figure class=\"epub-figure\">\n");
-                    if let Some(entry) = resolved_entry {
-                        let rel_path = normalize_portable_rel_path(&entry.relative_path);
+                    if let Some((entry, rel_path)) = resolved_entry {
                         let alt = if caption.trim().is_empty() {
                             &entry.original_filename
                         } else {
@@ -860,16 +880,54 @@ fn infer_mime_type(path: &str) -> &'static str {
 }
 
 fn escape_css_string(input: &str) -> String {
-    input.replace('\\', "\\\\").replace('"', "\\\"")
+    input
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '"' | '\'' | ';' | '{' | '}' | '<' | '>' | '\\'))
+        .collect()
 }
 
-fn escape_xml(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+/// Strips CSS/XHTML attribute injection characters (`['"', '\'', ';', '{', '}', '<', '>', '\\', '\n', '\r']`)
+/// and control characters from a CSS font family identifier.
+pub fn sanitize_css_identifier(input: &str) -> String {
+    let cleaned: String = input
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '"' | '\'' | ';' | '{' | '}' | '<' | '>' | '\\' | '\n' | '\r'
+                )
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "serif".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Strips invalid XML 1.0 control characters (`\u{0000}..=\u{0008}`, `\u{000B}`, `\u{000C}`,
+/// `\u{000E}..=\u{001F}`) and escapes XML special entities (`&`, `<`, `>`, `"`, `'`).
+pub fn escape_xml(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(
+            ch,
+            '\u{0000}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}'
+        ) {
+            continue;
+        }
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1100,5 +1158,76 @@ mod tests {
             assert!(page1.contains("<hr class=\"divider\"/>"));
             assert!(page1.contains("<p class=\"story-para align-justify\">"));
         }
+    }
+
+    #[test]
+    fn epub_neutralizes_xml_control_chars_and_css_html_injection_payloads() {
+        assert_eq!(
+            escape_xml("Hello\x00\x07<script>alert(1)</script>"),
+            "Hello&lt;script&gt;alert(1)&lt;/script&gt;"
+        );
+        assert_eq!(
+            sanitize_css_identifier("Literata';background:url(javascript:alert(1));\""),
+            "Literatabackground:url(javascript:alert(1))"
+        );
+
+        let mut doc = BookDocument::default();
+        doc.metadata.title = "Title\x00\x07<script>evil()</script>".to_string();
+        let story = Story::new(
+            "Injected Story",
+            "Body\x00\x07 text with <b>tags</b>",
+            TextStyle {
+                font_family: "Literata\" onclick=\"alert(1);};".to_string(),
+                ..TextStyle::default()
+            },
+        );
+        let story_id = doc.insert_story(story);
+        doc.pages[0]
+            .frames
+            .push(Frame::new_text(Rect::new(36.0, 36.0, 300.0, 120.0), story_id, 0));
+
+        // Insert a tampered asset with path traversal in `relative_path`
+        doc.assets.insert(
+            "malicious_asset".to_string(),
+            AssetEntry {
+                id: "malicious_asset".to_string(),
+                kind: AssetKind::Image,
+                relative_path: "../../etc/passwd".to_string(),
+                original_filename: "passwd".to_string(),
+                mime_type: "image/png".to_string(),
+                pixel_dimensions: None,
+            },
+        );
+        doc.asset_bytes
+            .insert("malicious_asset".to_string(), vec![1, 2, 3]);
+
+        let layout = ComputedBookLayout::compute(&doc);
+        let bytes = export_epub_bytes(&doc, &layout, EpubLayoutMode::FixedLayout)
+            .expect("EPUB export should succeed safely");
+
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        assert!(
+            archive.by_name("OEBPS/../../etc/passwd").is_err(),
+            "Malicious relative_path must never be written into EPUB archive"
+        );
+
+        let mut opf = String::new();
+        archive
+            .by_name("OEBPS/content.opf")
+            .unwrap()
+            .read_to_string(&mut opf)
+            .unwrap();
+        assert!(!opf.contains('\0') && !opf.contains('\x07'));
+        assert!(!opf.contains("<script>"));
+        assert!(!opf.contains("etc/passwd"));
+
+        let mut page1 = String::new();
+        archive
+            .by_name("OEBPS/page_001.xhtml")
+            .unwrap()
+            .read_to_string(&mut page1)
+            .unwrap();
+        assert!(!page1.contains('\0') && !page1.contains('\x07'));
+        assert!(!page1.contains("onclick=\"alert(1)"));
     }
 }
