@@ -1,0 +1,42 @@
+name: Build macOS (M1 Air) & Linux Binaries
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+jobs:
+  build-macos-m1:
+    name: Build macOS Apple Silicon (M1 Air) .app
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain (aarch64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Workspace Unit Tests
+        run: cargo test --workspace
+
+      - name: Build Release Binary (Apple Silicon M1)
+        run: cargo build --release -p book-app --target aarch64-apple-darwin
+
+      - name: Package Book Creator.app Bundle
+        run: |
+          chmod +x scripts/bundle-macos-app.sh
+          ./scripts/bundle-macos-app.sh target/aarch64-apple-darwin/release/book-creator
+          ditto -c -k --keepParent "dist/Book Creator.app" Book-Creator-macOS-M1.zip
+
+      - name: Upload macOS M1 .app Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Book-Creator-macOS-M1-App
+          path: Book-Creator-macOS-M1.zip
+          if-no-files-found: error
